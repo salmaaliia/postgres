@@ -48,9 +48,15 @@ PG_FUNCTION_INFO_V1(bt_page_items_bytea);
 PG_FUNCTION_INFO_V1(bt_page_stats_1_9);
 PG_FUNCTION_INFO_V1(bt_page_stats);
 PG_FUNCTION_INFO_V1(bt_multi_page_stats);
+PG_FUNCTION_INFO_V1(bt_find_merge_candidates);
+PG_FUNCTION_INFO_V1(bt_merge_detail);
 
 #define IS_INDEX(r) ((r)->rd_rel->relkind == RELKIND_INDEX)
 #define IS_BTREE(r) ((r)->rd_rel->relam == BTREE_AM_OID)
+
+#define BTREE_MERGE_THRESHOLD  0.20  /* page must be ≤20% full to be a candidate */
+#define BTREE_TARGET_FILLFACTOR 0.90  /* merged result must stay ≤90% full */
+
 
 /* ------------------------------------------------
  * structure for single btree page statistics
@@ -98,6 +104,33 @@ typedef struct ua_page_items
 	TupleDesc	tupd;
 } ua_page_items;
 
+/**
+ * cross-call data structure for SRF for merge candidates
+ */
+typedef struct ua_merge_candidates
+{
+	Oid			relid;			/* index relation OID — reopened each call */
+	BlockNumber	current_blkno;	/* current position in the leaf chain */
+	TupleDesc	tupd;
+	float8		threshold;		/* min_pct_threshold as a fraction (0.0–1.0) */
+	int			num_pages;		/* max candidates to return */
+	int			returned;		/* candidates returned so far */
+
+} ua_merge_candidates;
+
+/*
+ * State for bt_merge_detail(): holds the three block numbers of the
+ * Parent / Left / Right page trio across SRF calls.
+ */
+typedef struct ua_merge_detail
+{
+	Oid			relid;
+	BlockNumber	parent_blkno;
+	BlockNumber	left_blkno;
+	BlockNumber	right_blkno;
+	int			call_cntr;		/* 0=parent, 1=left, 2=right */
+	TupleDesc	tupd;
+} ua_merge_detail;
 
 /* -------------------------------------------------
  * GetBTPageStatistics()
@@ -935,3 +968,533 @@ bt_metap(PG_FUNCTION_ARGS)
 
 	PG_RETURN_DATUM(result);
 }
+
+/*-------------------------------------------------------
+ * bt_find_merge_candidates()
+ *
+ * Scan the B-tree leaf chain left-to-right and return up to num_pages
+ * LEFT block numbers of adjacent leaf pairs where both pages are at most
+ * min_pct_threshold percent full and their combined content fits within
+ * the target fillfactor.  Only merge candidates are returned.
+ *
+ * Usage: SELECT * FROM bt_find_merge_candidates('t1_pkey', 50.0, 5);
+ *-------------------------------------------------------
+ */
+Datum
+bt_find_merge_candidates(PG_FUNCTION_ARGS)
+{
+	text			   *relname			 = PG_GETARG_TEXT_PP(0);
+	float8				min_pct_threshold	 = PG_GETARG_FLOAT8(1);
+	int32				num_pages			 = PG_GETARG_INT32(2);
+	Datum				result;
+	FuncCallContext    *fctx;
+	MemoryContext		mctx;
+	ua_merge_candidates *uargs;
+	Buffer				left_buf,
+						right_buf;
+	Page				left_page,
+						right_page;
+	BTPageOpaque		left_opaque;
+	BlockNumber			left_blkno,
+						right_blkno;
+	Size				left_free,
+						right_free;
+	Size				left_used,
+						right_used;
+	int					j;
+	Datum				values[5];
+	bool				nulls[5];
+	HeapTuple			tuple;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to use pageinspect functions")));
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		RangeVar   *relrv;
+		Relation	rel;
+		TupleDesc	tupleDesc;
+
+		fctx = SRF_FIRSTCALL_INIT();
+
+		relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
+		rel = relation_openrv(relrv, AccessShareLock);
+
+		if (!IS_INDEX(rel) || !IS_BTREE(rel))
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					errmsg("\"%s\" is not a %s index",
+							RelationGetRelationName(rel), "btree")));
+
+		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
+		uargs = palloc_object(ua_merge_candidates);
+
+		/*
+		 * Start at the leftmost leaf page.
+		 */
+		{
+			Buffer	endpoint_buf = _bt_get_endpoint(rel, 0, false);
+			uargs->current_blkno = BufferGetBlockNumber(endpoint_buf);
+			UnlockReleaseBuffer(endpoint_buf);
+		}
+
+		uargs->relid	 = RelationGetRelid(rel);
+		relation_close(rel, AccessShareLock);	
+
+		uargs->threshold = min_pct_threshold / 100.0;
+		uargs->num_pages = num_pages;
+		uargs->returned	 = 0;
+
+		/* Build a tuple descriptor for our result type */
+		if (get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+		tupleDesc = BlessTupleDesc(tupleDesc);
+
+		uargs->tupd = tupleDesc;
+		fctx->user_fctx = uargs;
+
+		MemoryContextSwitchTo(mctx);
+	}
+
+	fctx = SRF_PERCALL_SETUP();
+	uargs = fctx->user_fctx;
+
+	if (uargs->returned >= uargs->num_pages)
+		SRF_RETURN_DONE(fctx);
+
+	/*
+	 * Reopen the relation for this call.  We open and close it every call
+	 * so that a LIMIT early exit cannot leak a relcache reference.
+	 */
+	{
+		Relation	rel = relation_open(uargs->relid, AccessShareLock);
+
+		/*
+		 * Walk the leaf chain looking for the next merge candidate.
+		 * We skip non-candidates and stop at the rightmost leaf or end of chain.
+		 */
+		for (;;)
+		{
+			CHECK_FOR_INTERRUPTS();
+
+			if (uargs->current_blkno == P_NONE)
+			{
+				relation_close(rel, AccessShareLock);
+				SRF_RETURN_DONE(fctx);
+			}
+
+			left_blkno	 = uargs->current_blkno;
+			left_buf	 = ReadBuffer(rel, left_blkno);
+			LockBuffer(left_buf, BUFFER_LOCK_SHARE);
+			left_page	 = BufferGetPage(left_buf);
+			left_opaque = BTPageGetOpaque(left_page);
+
+			if (P_RIGHTMOST(left_opaque))
+			{
+				UnlockReleaseBuffer(left_buf);
+				relation_close(rel, AccessShareLock);
+				SRF_RETURN_DONE(fctx);
+			}
+
+			/* Skip deleted or non-leaf pages */
+			if (P_ISDELETED(left_opaque) || !P_ISLEAF(left_opaque))
+			{
+				uargs->current_blkno = left_opaque->btpo_next;
+				UnlockReleaseBuffer(left_buf);
+				continue;
+			}
+
+			/* Lock couple: acquire right BEFORE releasing left */
+			right_blkno = left_opaque->btpo_next;
+			left_free	 = PageGetFreeSpace(left_page);
+			right_buf	 = ReadBuffer(rel, right_blkno);
+			LockBuffer(right_buf, BUFFER_LOCK_SHARE);
+			right_page	 = BufferGetPage(right_buf);
+			right_free	 = PageGetFreeSpace(right_page);
+
+			UnlockReleaseBuffer(right_buf);
+			UnlockReleaseBuffer(left_buf);
+
+			uargs->current_blkno = right_blkno;
+
+			left_used  = BLCKSZ - left_free;
+			right_used = BLCKSZ - right_free;
+
+			/*
+			 * Merge candidate check: both pages must individually be below
+			 * the threshold AND their combined content must fit within the
+			 * target fillfactor.
+			 */
+			if ((float) left_used  / BLCKSZ <= uargs->threshold &&
+				(float) right_used / BLCKSZ <= uargs->threshold &&
+				(float)(left_used + right_used) / BLCKSZ <= BTREE_TARGET_FILLFACTOR)
+				break;			/* found a candidate — exit the walk loop */
+		}
+
+		relation_close(rel, AccessShareLock);
+	}
+
+	/* Build and return the output row */
+	uargs->returned++;
+	memset(nulls, false, sizeof(nulls));
+	j = 0;
+	values[j++] = Int64GetDatum((int64) left_blkno);
+	values[j++] = Int64GetDatum((int64) right_blkno);
+	values[j++] = Float8GetDatum(100.0 * left_free / BLCKSZ);
+	values[j++] = Float8GetDatum(100.0 * right_free / BLCKSZ);
+	/* free space the merged page would have */
+	values[j++] = Float8GetDatum(100.0 * ((int64) left_free + (int64) right_free - (int64) BLCKSZ) / BLCKSZ);
+
+	tuple  = heap_form_tuple(uargs->tupd, values, nulls);
+	result = HeapTupleGetDatum(tuple);
+	SRF_RETURN_NEXT(fctx, result);
+}
+
+/*-------------------------------------------------------
+ * bt_merge_detail()
+ *
+ * Given a LEFT leaf block number, find its Right sibling and Parent page
+ * using a proper O(log N) B-tree descent, then return one row of structural
+ * details for each of the three pages in this order: Parent, Left, Right.
+ *
+ * Each row contains the page header fields and a tid[] array.  For leaf
+ * pages the array holds heap TIDs (posting-list entries are expanded).
+ * For the parent page the array holds the child downlinks encoded as TIDs.
+ *
+ * merge_id is reserved for future use and is always NULL.
+ *
+ * Usage: SELECT * FROM bt_merge_detail('t1_pkey', 5);
+ *-------------------------------------------------------
+ */
+Datum
+bt_merge_detail(PG_FUNCTION_ARGS)
+{
+	FuncCallContext		   *fctx;
+	ua_merge_detail		   *uargs;
+
+	if (SRF_IS_FIRSTCALL())
+	{
+		text		   *relname = PG_GETARG_TEXT_PP(0);
+		int64			left_blkno_arg = PG_GETARG_INT64(1);
+		MemoryContext	mctx;
+		TupleDesc		tupleDesc;
+		Relation		rel;
+		List		   *relname_list;
+		RangeVar	   *relrv;
+		Buffer			left_buf;
+		Page			left_page;
+		BTPageOpaque	left_opaque;
+		OffsetNumber	first_data_off;
+		IndexTuple		first_itup;
+		BTScanInsert	scankey;
+		Buffer			found_buf = InvalidBuffer;
+		BTStack			stack;
+		BlockNumber		parent_blkno = InvalidBlockNumber;
+		BlockNumber		left_blkno;
+		BlockNumber		right_blkno;
+
+		fctx = SRF_FIRSTCALL_INIT();
+		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
+
+		uargs = palloc_object(ua_merge_detail);
+
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+					 errmsg("must be superuser to use pageinspect functions")));
+
+		/* Open and validate the relation */
+		relname_list = textToQualifiedNameList(relname);
+		relrv = makeRangeVarFromNameList(relname_list);
+		rel = relation_openrv(relrv, AccessShareLock);
+
+		if (!IS_INDEX(rel) || !IS_BTREE(rel))
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+					 errmsg("\"%s\" is not a btree index",
+							RelationGetRelationName(rel))));
+
+		left_blkno = (BlockNumber) left_blkno_arg;
+
+		/*
+		 * Step 1: Read the left leaf page to get right_blkno and the first
+		 * data tuple, which we will use to build the scan key for the descent.
+		 */
+		left_buf = ReadBuffer(rel, left_blkno);
+		LockBuffer(left_buf, BUFFER_LOCK_SHARE);
+		left_page = BufferGetPage(left_buf);
+		left_opaque = BTPageGetOpaque(left_page);
+
+		if (!P_ISLEAF(left_opaque))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("block %u is not a leaf page", left_blkno)));
+
+		right_blkno = left_opaque->btpo_next;
+
+		if (P_RIGHTMOST(left_opaque))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("block %u is the rightmost leaf — it has no right sibling",
+							left_blkno)));
+
+		/*
+		 * P_FIRSTDATAKEY returns the offset of the first real data tuple,
+		 * skipping the high-key slot on non-leftmost pages.
+		 */
+		first_data_off = P_FIRSTDATAKEY(left_opaque);
+		if (first_data_off > PageGetMaxOffsetNumber(left_page))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("leaf page %u is empty — cannot determine parent",
+							left_blkno)));
+
+		first_itup = (IndexTuple) PageGetItem(left_page,
+								PageGetItemId(left_page, first_data_off));
+
+		/*
+		 * Build a typed scan key from the tuple using the relation schema.
+		 * _bt_mkscankey reads the TupleDesc and operator classes from rel,
+		 * so our extension does not need to know the column data types.
+		 */
+		scankey = _bt_mkscankey(rel, first_itup);
+
+		UnlockReleaseBuffer(left_buf);	/* release left before the descent */
+
+		/*
+		 * Step 2: Descend from the root in O(log N) reads.
+		 * _bt_search returns:
+		 *   - found_buf: the leaf buffer (locked); we release it immediately.
+		 *   - stack: linked list from root to parent; stack->bts_blkno is
+		 *     the block number of the immediate parent (level-1 page).
+		 */
+		stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ);
+		if (stack != NULL)
+			parent_blkno = stack->bts_blkno;
+
+		if (BufferIsValid(found_buf))
+			UnlockReleaseBuffer(found_buf);
+		if (stack != NULL)
+			_bt_freestack(stack);
+		pfree(scankey);
+
+		if (parent_blkno == InvalidBlockNumber)
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("could not find parent page for leaf block %u",
+							left_blkno)));
+
+		/*
+		 * Step 3: Verify that Right is also a child of the same parent.
+		 *
+		 * Adjacent leaf siblings do NOT always share the same parent — they
+		 * can straddle a parent-page boundary after a split.  Instead of a
+		 * second O(log N) descent, we simply scan the parent page we already
+		 * have: if right_blkno does not appear as a downlink there, the two
+		 * leaves have different parents and cannot be merged with a single
+		 * parent update.
+		 */
+		{
+			Buffer			parent_buf;
+			Page			parent_page;
+			OffsetNumber	off,
+							maxoff;
+			bool			found_right = false;
+
+			parent_buf = ReadBuffer(rel, parent_blkno);
+			LockBuffer(parent_buf, BUFFER_LOCK_SHARE);
+			parent_page = BufferGetPage(parent_buf);
+			maxoff = PageGetMaxOffsetNumber(parent_page);
+
+			/* For non-rightmost pages, offset 1 is the HIGH KEY — its t_tid holds
+			 * the separator key's downlink to the adjacent page, NOT a child of this
+			 * page.  Start from offset 2 to scan only real downlinks.
+			 */
+			{
+				BTPageOpaque pOpaque = BTPageGetOpaque(parent_page);
+				OffsetNumber scan_start = P_RIGHTMOST(pOpaque) ?
+					FirstOffsetNumber : OffsetNumberNext(P_HIKEY);
+
+				for (off = scan_start; off <= maxoff; off++)
+				{
+					IndexTuple	itup = (IndexTuple) PageGetItem(parent_page,
+												PageGetItemId(parent_page, off));
+
+					if (ItemPointerGetBlockNumberNoCheck(&itup->t_tid) == right_blkno)
+					{
+						found_right = true;
+						break;
+					}
+				}
+			}
+
+			UnlockReleaseBuffer(parent_buf);
+
+			if (!found_right)
+            {
+                ereport(ERROR,
+                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+                         errmsg("pages cannot be merged: left block %u and right block %u span a parent boundary",
+                                left_blkno, right_blkno),
+                         errhint("Parent block %u does not contain the right block.", parent_blkno)));
+            }
+		}
+
+		/*
+		 * Store only the relation Oid so we can safely reopen it on every
+		 * per-call invocation without leaking a relcache reference on LIMIT.
+		 */
+		uargs->relid		= RelationGetRelid(rel);
+		relation_close(rel, AccessShareLock);
+
+		uargs->parent_blkno = parent_blkno;
+		uargs->left_blkno	= left_blkno;
+		uargs->right_blkno	= right_blkno;
+		uargs->call_cntr	= 0;
+
+		if (get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+		tupleDesc = BlessTupleDesc(tupleDesc);
+
+		uargs->tupd = tupleDesc;
+		fctx->user_fctx = uargs;
+
+		MemoryContextSwitchTo(mctx);
+	}
+
+	fctx = SRF_PERCALL_SETUP();
+	uargs = fctx->user_fctx;
+
+	/* We return exactly 3 rows: 0=parent, 1=left, 2=right */
+	if (uargs->call_cntr >= 3)
+		SRF_RETURN_DONE(fctx);
+
+	{
+		Relation		rel = relation_open(uargs->relid, AccessShareLock);
+		BlockNumber		blkno;
+		const char	   *role;
+		Buffer			buf;
+		Page			page;
+		BTPageOpaque	opaque;
+		OffsetNumber	off,
+						maxoff,
+						first_off;
+		int				max_tids;
+		ItemPointerData *tids_buf;
+		int				ntids = 0;
+		Datum		   *tids_datum;
+		Datum			values[10];
+		bool			nulls[10];
+		int				j;
+		HeapTuple		tuple;
+		Datum			result;
+
+		switch (uargs->call_cntr)
+		{
+			case 0:
+				blkno = uargs->parent_blkno;
+				role = "parent_TEST";
+				break;
+			case 1:
+				blkno = uargs->left_blkno;
+				role = "left";
+				break;
+			default:
+				blkno = uargs->right_blkno;
+				role = "right";
+				break;
+		}
+
+		buf = ReadBuffer(rel, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buf);
+		opaque = BTPageGetOpaque(page);
+		maxoff = PageGetMaxOffsetNumber(page);
+
+		/*
+		 * Collect TIDs / downlinks from the page.
+		 *
+		 * Leaf pages: iterate data tuples (skip high key via P_FIRSTDATAKEY).
+		 *   - Posting-list tuples: expand with BTreeTupleGetPosting().
+		 *   - Normal tuples: take t_tid directly.
+		 *
+		 * Parent page: all items are pivot tuples; the block-number part of
+		 * t_tid is the child downlink.  Skip minus-infinity entries that have
+		 * no real downlink (InvalidBlockNumber).
+		 *
+		 * Upper bound: 2*BLCKSZ/sizeof(ItemPointerData) covers any real page.
+		 */
+		max_tids = 2 * BLCKSZ / sizeof(ItemPointerData);
+		tids_buf = (ItemPointerData *) palloc(max_tids * sizeof(ItemPointerData));
+
+		if (P_ISLEAF(opaque))
+		{
+			first_off = P_FIRSTDATAKEY(opaque);
+			for (off = first_off; off <= maxoff; off++)
+			{
+				IndexTuple	itup = (IndexTuple) PageGetItem(page,
+										PageGetItemId(page, off));
+
+				if (BTreeTupleIsPosting(itup))
+				{
+					int			nposting = BTreeTupleGetNPosting(itup);
+					ItemPointer posting = BTreeTupleGetPosting(itup);
+
+					for (int i = 0; i < nposting && ntids < max_tids; i++)
+						tids_buf[ntids++] = posting[i];
+				}
+				else
+				{
+					if (ntids < max_tids)
+						tids_buf[ntids++] = itup->t_tid;
+				}
+			}
+		}
+		else
+		{
+			for (off = FirstOffsetNumber; off <= maxoff; off++)
+			{
+				IndexTuple	itup = (IndexTuple) PageGetItem(page,
+										PageGetItemId(page, off));
+
+				if (BTreeTupleIsPivot(itup) &&
+					ItemPointerGetBlockNumberNoCheck(&itup->t_tid) != InvalidBlockNumber)
+				{
+					if (ntids < max_tids)
+						tids_buf[ntids++] = itup->t_tid;
+				}
+			}
+		}
+
+		UnlockReleaseBuffer(buf);
+		relation_close(rel, AccessShareLock);
+
+		/* Convert tids_buf into a Datum array for construct_array_builtin */
+		tids_datum = (Datum *) palloc(ntids * sizeof(Datum));
+		for (int i = 0; i < ntids; i++)
+			tids_datum[i] = ItemPointerGetDatum(&tids_buf[i]);
+
+		/* Build output tuple */
+		memset(nulls, false, sizeof(nulls));
+		j = 0;
+		values[j++] = CStringGetTextDatum(role);
+		values[j++] = Int64GetDatum((int64) blkno);
+		values[j++] = Int64GetDatum((int64) opaque->btpo_prev);
+		values[j++] = Int64GetDatum((int64) opaque->btpo_next);
+		values[j++] = Int32GetDatum((int32) opaque->btpo_level);
+		values[j++] = Int32GetDatum((int32) opaque->btpo_flags);
+		values[j++] = Int32GetDatum((int32) PageGetFreeSpace(page));
+		nulls[j++]  = true;				/* merge_id: RFU, always NULL */
+		values[j++] = PointerGetDatum(
+						construct_array_builtin(tids_datum, ntids, TIDOID));
+
+		tuple  = heap_form_tuple(uargs->tupd, values, nulls);
+		result = HeapTupleGetDatum(tuple);
+
+		uargs->call_cntr++;
+		SRF_RETURN_NEXT(fctx, result);
+	}
+}
+
