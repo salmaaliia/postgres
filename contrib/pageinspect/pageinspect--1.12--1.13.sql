@@ -72,3 +72,47 @@ LANGUAGE SQL PARALLEL RESTRICTED
 BEGIN ATOMIC
 SELECT * FROM heap_page_item_attrs(page, rel_oid, false);
 END;
+
+
+--
+-- bt_find_merge_candidates(relname, min_pct_threshold, num_pages)
+--
+-- Scan the B-tree leaf chain and return up to num_pages LEFT block numbers
+-- of adjacent pairs that are merge candidates (both pages <= min_pct_threshold
+-- percent full, and combined content fits within the target fillfactor).
+--
+CREATE FUNCTION bt_find_merge_candidates(
+    IN  relname           text,
+    IN  min_pct_threshold float8 DEFAULT 10.0,
+    IN  num_pages         int4   DEFAULT 1,
+    OUT left_blkno        int8,
+    OUT right_blkno       int8,
+    OUT free_space_left   float8,
+    OUT free_space_right  float8,
+    OUT total_free_space  float8)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'bt_find_merge_candidates'
+LANGUAGE C PARALLEL SAFE;
+
+--
+-- bt_merge_detail(relname, left_blkno)
+--
+-- Given the LEFT leaf block number, find its Right sibling and Parent via
+-- a proper B-tree descent (O(log N)), then return one detail row for each
+-- of the three pages: Parent, Left, Right.
+--
+CREATE FUNCTION bt_merge_detail(
+    IN  relname     text,
+    IN  left_blkno  bigint,
+    OUT page_role   text,
+    OUT blkno       bigint,
+    OUT prev_blkno  bigint,
+    OUT next_blkno  bigint,
+    OUT level       integer,
+    OUT btpo_flags  integer,
+    OUT free_size   integer,
+    OUT merge_id    integer,
+    OUT tids        tid[])
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'bt_merge_detail'
+LANGUAGE C PARALLEL SAFE;
