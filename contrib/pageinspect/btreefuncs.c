@@ -54,8 +54,9 @@ PG_FUNCTION_INFO_V1(bt_merge_detail);
 #define IS_INDEX(r) ((r)->rd_rel->relkind == RELKIND_INDEX)
 #define IS_BTREE(r) ((r)->rd_rel->relam == BTREE_AM_OID)
 
-#define BTREE_MERGE_THRESHOLD  0.20  /* page must be ≤20% full to be a candidate */
-#define BTREE_TARGET_FILLFACTOR 0.90  /* merged result must stay ≤90% full */
+#define BTREE_MERGE_THRESHOLD  0.20 /* page must be ≤20% full to be a
+									 * candidate */
+#define BTREE_TARGET_FILLFACTOR 0.90	/* merged result must stay ≤90% full */
 
 
 /* ------------------------------------------------
@@ -110,13 +111,13 @@ typedef struct ua_page_items
 typedef struct ua_merge_candidates
 {
 	Oid			relid;			/* index relation OID — reopened each call */
-	BlockNumber	current_blkno;	/* current position in the leaf chain */
+	BlockNumber current_blkno;	/* current position in the leaf chain */
 	TupleDesc	tupd;
 	float8		threshold;		/* min_pct_threshold as a fraction (0.0–1.0) */
 	int			num_pages;		/* max candidates to return */
 	int			returned;		/* candidates returned so far */
 
-} ua_merge_candidates;
+}			ua_merge_candidates;
 
 /*
  * State for bt_merge_detail(): holds the three block numbers of the
@@ -125,12 +126,13 @@ typedef struct ua_merge_candidates
 typedef struct ua_merge_detail
 {
 	Oid			relid;
-	BlockNumber	parent_blkno;
-	BlockNumber	left_blkno;
-	BlockNumber	right_blkno;
+	BlockNumber parent_blkno;
+	BlockNumber left_blkno;
+	BlockNumber right_blkno;
 	int			call_cntr;		/* 0=parent, 1=left, 2=right */
+	bool		show_tids;
 	TupleDesc	tupd;
-} ua_merge_detail;
+}			ua_merge_detail;
 
 /* -------------------------------------------------
  * GetBTPageStatistics()
@@ -983,28 +985,28 @@ bt_metap(PG_FUNCTION_ARGS)
 Datum
 bt_find_merge_candidates(PG_FUNCTION_ARGS)
 {
-	text			   *relname			 = PG_GETARG_TEXT_PP(0);
-	float8				min_pct_threshold	 = PG_GETARG_FLOAT8(1);
-	int32				num_pages			 = PG_GETARG_INT32(2);
-	Datum				result;
-	FuncCallContext    *fctx;
-	MemoryContext		mctx;
+	text	   *relname = PG_GETARG_TEXT_PP(0);
+	float8		min_pct_threshold = PG_GETARG_FLOAT8(1);
+	int32		num_pages = PG_GETARG_INT32(2);
+	Datum		result;
+	FuncCallContext *fctx;
+	MemoryContext mctx;
 	ua_merge_candidates *uargs;
-	Buffer				left_buf,
-						right_buf;
-	Page				left_page,
-						right_page;
-	BTPageOpaque		left_opaque;
-	BlockNumber			left_blkno,
-						right_blkno;
-	Size				left_free,
-						right_free;
-	Size				left_used,
-						right_used;
-	int					j;
-	Datum				values[5];
-	bool				nulls[5];
-	HeapTuple			tuple;
+	Buffer		left_buf,
+				right_buf;
+	Page		left_page,
+				right_page;
+	BTPageOpaque left_opaque;
+	BlockNumber left_blkno,
+				right_blkno;
+	Size		left_free,
+				right_free;
+	Size		left_used,
+				right_used;
+	int			j;
+	Datum		values[5];
+	bool		nulls[5];
+	HeapTuple	tuple;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -1023,10 +1025,9 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		rel = relation_openrv(relrv, AccessShareLock);
 
 		if (!IS_INDEX(rel) || !IS_BTREE(rel))
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					errmsg("\"%s\" is not a %s index",
-							RelationGetRelationName(rel), "btree")));
+			ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							errmsg("\"%s\" is not a %s index",
+								   RelationGetRelationName(rel), "btree")));
 
 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
 		uargs = palloc_object(ua_merge_candidates);
@@ -1035,17 +1036,18 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		 * Start at the leftmost leaf page.
 		 */
 		{
-			Buffer	endpoint_buf = _bt_get_endpoint(rel, 0, false);
+			Buffer		endpoint_buf = _bt_get_endpoint(rel, 0, false);
+
 			uargs->current_blkno = BufferGetBlockNumber(endpoint_buf);
 			UnlockReleaseBuffer(endpoint_buf);
 		}
 
-		uargs->relid	 = RelationGetRelid(rel);
-		relation_close(rel, AccessShareLock);	
+		uargs->relid = RelationGetRelid(rel);
+		relation_close(rel, AccessShareLock);
 
 		uargs->threshold = min_pct_threshold / 100.0;
 		uargs->num_pages = num_pages;
-		uargs->returned	 = 0;
+		uargs->returned = 0;
 
 		/* Build a tuple descriptor for our result type */
 		if (get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)
@@ -1065,15 +1067,15 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		SRF_RETURN_DONE(fctx);
 
 	/*
-	 * Reopen the relation for this call.  We open and close it every call
-	 * so that a LIMIT early exit cannot leak a relcache reference.
+	 * Reopen the relation for this call.  We open and close it every call so
+	 * that a LIMIT early exit cannot leak a relcache reference.
 	 */
 	{
 		Relation	rel = relation_open(uargs->relid, AccessShareLock);
 
 		/*
-		 * Walk the leaf chain looking for the next merge candidate.
-		 * We skip non-candidates and stop at the rightmost leaf or end of chain.
+		 * Walk the leaf chain looking for the next merge candidate. We skip
+		 * non-candidates and stop at the rightmost leaf or end of chain.
 		 */
 		for (;;)
 		{
@@ -1085,10 +1087,10 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				SRF_RETURN_DONE(fctx);
 			}
 
-			left_blkno	 = uargs->current_blkno;
-			left_buf	 = ReadBuffer(rel, left_blkno);
+			left_blkno = uargs->current_blkno;
+			left_buf = ReadBuffer(rel, left_blkno);
 			LockBuffer(left_buf, BUFFER_LOCK_SHARE);
-			left_page	 = BufferGetPage(left_buf);
+			left_page = BufferGetPage(left_buf);
 			left_opaque = BTPageGetOpaque(left_page);
 
 			if (P_RIGHTMOST(left_opaque))
@@ -1108,18 +1110,18 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 
 			/* Lock couple: acquire right BEFORE releasing left */
 			right_blkno = left_opaque->btpo_next;
-			left_free	 = PageGetFreeSpace(left_page);
-			right_buf	 = ReadBuffer(rel, right_blkno);
+			left_free = PageGetFreeSpace(left_page);
+			right_buf = ReadBuffer(rel, right_blkno);
 			LockBuffer(right_buf, BUFFER_LOCK_SHARE);
-			right_page	 = BufferGetPage(right_buf);
-			right_free	 = PageGetFreeSpace(right_page);
+			right_page = BufferGetPage(right_buf);
+			right_free = PageGetFreeSpace(right_page);
 
 			UnlockReleaseBuffer(right_buf);
 			UnlockReleaseBuffer(left_buf);
 
 			uargs->current_blkno = right_blkno;
 
-			left_used  = BLCKSZ - left_free;
+			left_used = BLCKSZ - left_free;
 			right_used = BLCKSZ - right_free;
 
 			/*
@@ -1127,9 +1129,9 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 			 * the threshold AND their combined content must fit within the
 			 * target fillfactor.
 			 */
-			if ((float) left_used  / BLCKSZ <= uargs->threshold &&
+			if ((float) left_used / BLCKSZ <= uargs->threshold &&
 				(float) right_used / BLCKSZ <= uargs->threshold &&
-				(float)(left_used + right_used) / BLCKSZ <= BTREE_TARGET_FILLFACTOR)
+				(float) (left_used + right_used) / BLCKSZ <= BTREE_TARGET_FILLFACTOR)
 				break;			/* found a candidate — exit the walk loop */
 		}
 
@@ -1145,11 +1147,44 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 	values[j++] = Float8GetDatum(100.0 * left_free / BLCKSZ);
 	values[j++] = Float8GetDatum(100.0 * right_free / BLCKSZ);
 	/* free space the merged page would have */
-	values[j++] = Float8GetDatum(100.0 * ((int64) left_free + (int64) right_free - (int64) BLCKSZ) / BLCKSZ);
+	values[j++] = Float8GetDatum(
+								 100.0 * ((int64) left_free + (int64) right_free - (int64) BLCKSZ) / BLCKSZ);
 
-	tuple  = heap_form_tuple(uargs->tupd, values, nulls);
+	tuple = heap_form_tuple(uargs->tupd, values, nulls);
 	result = HeapTupleGetDatum(tuple);
 	SRF_RETURN_NEXT(fctx, result);
+}
+
+static char *
+index_tuple_data(IndexTuple itup)
+{
+	char	   *ptr;
+	int			dlen;
+	char	   *dump;
+	char	   *datacstring;
+
+	ptr = (char *) itup + IndexInfoFindDataOffset(itup->t_info);
+	dlen = IndexTupleSize(itup) - IndexInfoFindDataOffset(itup->t_info);
+
+	if (BTreeTupleIsPosting(itup))
+		dlen -= IndexTupleSize(itup) - BTreeTupleGetPostingOffset(itup);
+	else if (BTreeTupleIsPivot(itup) && BTreeTupleGetHeapTID(itup) != NULL)
+		dlen -= MAXALIGN(sizeof(ItemPointerData));
+
+	if (dlen < 0 || dlen > INDEX_SIZE_MASK)
+		elog(ERROR, "invalid tuple length %d", dlen);
+
+	dump = palloc0(dlen * 3 + 1);
+	datacstring = dump;
+	for (int off = 0; off < dlen; off++)
+	{
+		if (off > 0)
+			*dump++ = ' ';
+		sprintf(dump, "%02x", *(ptr + off) & 0xff);
+		dump += 2;
+	}
+
+	return datacstring;
 }
 
 /*-------------------------------------------------------
@@ -1171,29 +1206,29 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 Datum
 bt_merge_detail(PG_FUNCTION_ARGS)
 {
-	FuncCallContext		   *fctx;
-	ua_merge_detail		   *uargs;
+	FuncCallContext *fctx;
+	ua_merge_detail *uargs;
 
 	if (SRF_IS_FIRSTCALL())
 	{
-		text		   *relname = PG_GETARG_TEXT_PP(0);
-		int64			left_blkno_arg = PG_GETARG_INT64(1);
-		MemoryContext	mctx;
-		TupleDesc		tupleDesc;
-		Relation		rel;
-		List		   *relname_list;
-		RangeVar	   *relrv;
-		Buffer			left_buf;
-		Page			left_page;
-		BTPageOpaque	left_opaque;
-		OffsetNumber	first_data_off;
-		IndexTuple		first_itup;
-		BTScanInsert	scankey;
-		Buffer			found_buf = InvalidBuffer;
-		BTStack			stack;
-		BlockNumber		parent_blkno = InvalidBlockNumber;
-		BlockNumber		left_blkno;
-		BlockNumber		right_blkno;
+		text	   *relname = PG_GETARG_TEXT_PP(0);
+		int64		left_blkno_arg = PG_GETARG_INT64(1);
+		MemoryContext mctx;
+		TupleDesc	tupleDesc;
+		Relation	rel;
+		List	   *relname_list;
+		RangeVar   *relrv;
+		Buffer		left_buf;
+		Page		left_page;
+		BTPageOpaque left_opaque;
+		OffsetNumber first_data_off;
+		IndexTuple	first_itup;
+		BTScanInsert scankey;
+		Buffer		found_buf = InvalidBuffer;
+		BTStack		stack;
+		BlockNumber parent_blkno = InvalidBlockNumber;
+		BlockNumber left_blkno;
+		BlockNumber right_blkno;
 
 		fctx = SRF_FIRSTCALL_INIT();
 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
@@ -1211,16 +1246,16 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		rel = relation_openrv(relrv, AccessShareLock);
 
 		if (!IS_INDEX(rel) || !IS_BTREE(rel))
-			ereport(ERROR,
-					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-					 errmsg("\"%s\" is not a btree index",
-							RelationGetRelationName(rel))));
+			ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
+							errmsg("\"%s\" is not a btree index",
+								   RelationGetRelationName(rel))));
 
 		left_blkno = (BlockNumber) left_blkno_arg;
 
 		/*
 		 * Step 1: Read the left leaf page to get right_blkno and the first
-		 * data tuple, which we will use to build the scan key for the descent.
+		 * data tuple, which we will use to build the scan key for the
+		 * descent.
 		 */
 		left_buf = ReadBuffer(rel, left_blkno);
 		LockBuffer(left_buf, BUFFER_LOCK_SHARE);
@@ -1228,16 +1263,16 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		left_opaque = BTPageGetOpaque(left_page);
 
 		if (!P_ISLEAF(left_opaque))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("block %u is not a leaf page", left_blkno)));
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("block %u is not a leaf page", left_blkno)));
 
 		right_blkno = left_opaque->btpo_next;
 
 		if (P_RIGHTMOST(left_opaque))
-			ereport(ERROR,
+			ereport(
+					ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("block %u is the rightmost leaf — it has no right sibling",
+					 errmsg("block %u is the rightmost leaf �154� it has no right sibling",
 							left_blkno)));
 
 		/*
@@ -1246,29 +1281,28 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		 */
 		first_data_off = P_FIRSTDATAKEY(left_opaque);
 		if (first_data_off > PageGetMaxOffsetNumber(left_page))
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("leaf page %u is empty — cannot determine parent",
-							left_blkno)));
+			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+							errmsg("leaf page %u is empty �203� cannot determine parent",
+								   left_blkno)));
 
-		first_itup = (IndexTuple) PageGetItem(left_page,
-								PageGetItemId(left_page, first_data_off));
+		first_itup = (IndexTuple) PageGetItem(
+											  left_page, PageGetItemId(left_page, first_data_off));
 
 		/*
 		 * Build a typed scan key from the tuple using the relation schema.
-		 * _bt_mkscankey reads the TupleDesc and operator classes from rel,
-		 * so our extension does not need to know the column data types.
+		 * _bt_mkscankey reads the TupleDesc and operator classes from rel, so
+		 * our extension does not need to know the column data types.
 		 */
 		scankey = _bt_mkscankey(rel, first_itup);
 
 		UnlockReleaseBuffer(left_buf);	/* release left before the descent */
 
 		/*
-		 * Step 2: Descend from the root in O(log N) reads.
-		 * _bt_search returns:
-		 *   - found_buf: the leaf buffer (locked); we release it immediately.
-		 *   - stack: linked list from root to parent; stack->bts_blkno is
-		 *     the block number of the immediate parent (level-1 page).
+		 * Step 2: Descend from the root in O(log N) reads. _bt_search
+		 * returns: - found_buf: the leaf buffer (locked); we release it
+		 * immediately. - stack: linked list from root to parent;
+		 * stack->bts_blkno is the block number of the immediate parent
+		 * (level-1 page).
 		 */
 		stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ);
 		if (stack != NULL)
@@ -1281,10 +1315,9 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		pfree(scankey);
 
 		if (parent_blkno == InvalidBlockNumber)
-			ereport(ERROR,
-					(errcode(ERRCODE_INTERNAL_ERROR),
-					 errmsg("could not find parent page for leaf block %u",
-							left_blkno)));
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("could not find parent page for leaf block %u",
+								   left_blkno)));
 
 		/*
 		 * Step 3: Verify that Right is also a child of the same parent.
@@ -1297,30 +1330,33 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		 * parent update.
 		 */
 		{
-			Buffer			parent_buf;
-			Page			parent_page;
-			OffsetNumber	off,
-							maxoff;
-			bool			found_right = false;
+			Buffer		parent_buf;
+			Page		parent_page;
+			OffsetNumber off,
+						maxoff;
+			bool		found_right = false;
 
 			parent_buf = ReadBuffer(rel, parent_blkno);
 			LockBuffer(parent_buf, BUFFER_LOCK_SHARE);
 			parent_page = BufferGetPage(parent_buf);
 			maxoff = PageGetMaxOffsetNumber(parent_page);
 
-			/* For non-rightmost pages, offset 1 is the HIGH KEY — its t_tid holds
-			 * the separator key's downlink to the adjacent page, NOT a child of this
-			 * page.  Start from offset 2 to scan only real downlinks.
+			/*
+			 * For non-rightmost pages, offset 1 is the HIGH KEY — its t_tid
+			 * holds the separator key's downlink to the adjacent page, NOT a
+			 * child of this page.  Start from offset 2 to scan only real
+			 * downlinks.
 			 */
 			{
 				BTPageOpaque pOpaque = BTPageGetOpaque(parent_page);
-				OffsetNumber scan_start = P_RIGHTMOST(pOpaque) ?
-					FirstOffsetNumber : OffsetNumberNext(P_HIKEY);
+				OffsetNumber scan_start = P_RIGHTMOST(pOpaque)
+					? FirstOffsetNumber
+					: OffsetNumberNext(P_HIKEY);
 
 				for (off = scan_start; off <= maxoff; off++)
 				{
-					IndexTuple	itup = (IndexTuple) PageGetItem(parent_page,
-												PageGetItemId(parent_page, off));
+					IndexTuple	itup = (IndexTuple) PageGetItem(
+																parent_page, PageGetItemId(parent_page, off));
 
 					if (ItemPointerGetBlockNumberNoCheck(&itup->t_tid) == right_blkno)
 					{
@@ -1333,26 +1369,29 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 			UnlockReleaseBuffer(parent_buf);
 
 			if (!found_right)
-            {
-                ereport(ERROR,
-                        (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-                         errmsg("pages cannot be merged: left block %u and right block %u span a parent boundary",
-                                left_blkno, right_blkno),
-                         errhint("Parent block %u does not contain the right block.", parent_blkno)));
-            }
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("pages cannot be merged: left block %u and right block "
+								"%u span a parent boundary",
+								left_blkno, right_blkno),
+						 errhint("Parent block %u does not contain the right block.",
+								 parent_blkno)));
+			}
 		}
 
 		/*
 		 * Store only the relation Oid so we can safely reopen it on every
 		 * per-call invocation without leaking a relcache reference on LIMIT.
 		 */
-		uargs->relid		= RelationGetRelid(rel);
+		uargs->relid = RelationGetRelid(rel);
 		relation_close(rel, AccessShareLock);
 
 		uargs->parent_blkno = parent_blkno;
-		uargs->left_blkno	= left_blkno;
-		uargs->right_blkno	= right_blkno;
-		uargs->call_cntr	= 0;
+		uargs->left_blkno = left_blkno;
+		uargs->right_blkno = right_blkno;
+		uargs->call_cntr = 0;
+		uargs->show_tids = PG_GETARG_BOOL(2);
 
 		if (get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)
 			elog(ERROR, "return type must be a row type");
@@ -1372,30 +1411,38 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		SRF_RETURN_DONE(fctx);
 
 	{
-		Relation		rel = relation_open(uargs->relid, AccessShareLock);
-		BlockNumber		blkno;
-		const char	   *role;
-		Buffer			buf;
-		Page			page;
-		BTPageOpaque	opaque;
-		OffsetNumber	off,
-						maxoff,
-						first_off;
-		int				max_tids;
+		Relation	rel = relation_open(uargs->relid, AccessShareLock);
+		BlockNumber blkno;
+		BlockNumber btpo_prev_val;
+		BlockNumber btpo_next_val;
+		uint32		btpo_flags_val;
+		uint32		btpo_level_val;
+		Size		free_size_val;
+		const char *role;
+		Buffer		buf;
+		Page		page;
+		BTPageOpaque opaque;
+		OffsetNumber off,
+					maxoff,
+					first_off;
+		char	   *high_key_hex = NULL;
+		char	   *first_val_hex = NULL;
+		char	   *last_val_hex = NULL;
+		int			max_tids;
 		ItemPointerData *tids_buf;
-		int				ntids = 0;
-		Datum		   *tids_datum;
-		Datum			values[10];
-		bool			nulls[10];
-		int				j;
-		HeapTuple		tuple;
-		Datum			result;
+		int			ntids = 0;
+		Datum	   *tids_datum;
+		Datum		values[14];
+		bool		nulls[14];
+		int			j;
+		HeapTuple	tuple;
+		Datum		result;
 
 		switch (uargs->call_cntr)
 		{
 			case 0:
 				blkno = uargs->parent_blkno;
-				role = "parent_TEST";
+				role = "parent";
 				break;
 			case 1:
 				blkno = uargs->left_blkno;
@@ -1413,12 +1460,18 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		opaque = BTPageGetOpaque(page);
 		maxoff = PageGetMaxOffsetNumber(page);
 
+		btpo_prev_val = opaque->btpo_prev;
+		btpo_next_val = opaque->btpo_next;
+		btpo_flags_val = opaque->btpo_flags;
+		btpo_level_val = opaque->btpo_level;
+		free_size_val = PageGetFreeSpace(page);
+
 		/*
 		 * Collect TIDs / downlinks from the page.
 		 *
 		 * Leaf pages: iterate data tuples (skip high key via P_FIRSTDATAKEY).
-		 *   - Posting-list tuples: expand with BTreeTupleGetPosting().
-		 *   - Normal tuples: take t_tid directly.
+		 * - Posting-list tuples: expand with BTreeTupleGetPosting(). - Normal
+		 * tuples: take t_tid directly.
 		 *
 		 * Parent page: all items are pivot tuples; the block-number part of
 		 * t_tid is the child downlink.  Skip minus-infinity entries that have
@@ -1434,8 +1487,8 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 			first_off = P_FIRSTDATAKEY(opaque);
 			for (off = first_off; off <= maxoff; off++)
 			{
-				IndexTuple	itup = (IndexTuple) PageGetItem(page,
-										PageGetItemId(page, off));
+				IndexTuple	itup =
+					(IndexTuple) PageGetItem(page, PageGetItemId(page, off));
 
 				if (BTreeTupleIsPosting(itup))
 				{
@@ -1451,16 +1504,42 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 						tids_buf[ntids++] = itup->t_tid;
 				}
 			}
+
+			/*
+			 * High key
+			 */
+			if (!P_RIGHTMOST(opaque))
+			{
+				IndexTuple	hikey =
+					(IndexTuple) PageGetItem(page, PageGetItemId(page, P_HIKEY));
+
+				high_key_hex = index_tuple_data(hikey);
+			}
+
+			/*
+			 * First and last data tuples
+			 */
+			if (first_off <= maxoff)
+			{
+				IndexTuple	first_itup =
+					(IndexTuple) PageGetItem(page, PageGetItemId(page, first_off));
+				IndexTuple	last_itup =
+					(IndexTuple) PageGetItem(page, PageGetItemId(page, maxoff));
+
+				first_val_hex = index_tuple_data(first_itup);
+				last_val_hex = index_tuple_data(last_itup);
+			}
 		}
 		else
 		{
 			for (off = FirstOffsetNumber; off <= maxoff; off++)
 			{
-				IndexTuple	itup = (IndexTuple) PageGetItem(page,
-										PageGetItemId(page, off));
+				IndexTuple	itup =
+					(IndexTuple) PageGetItem(page, PageGetItemId(page, off));
 
 				if (BTreeTupleIsPivot(itup) &&
-					ItemPointerGetBlockNumberNoCheck(&itup->t_tid) != InvalidBlockNumber)
+					ItemPointerGetBlockNumberNoCheck(&itup->t_tid) !=
+					InvalidBlockNumber)
 				{
 					if (ntids < max_tids)
 						tids_buf[ntids++] = itup->t_tid;
@@ -1481,20 +1560,36 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		j = 0;
 		values[j++] = CStringGetTextDatum(role);
 		values[j++] = Int64GetDatum((int64) blkno);
-		values[j++] = Int64GetDatum((int64) opaque->btpo_prev);
-		values[j++] = Int64GetDatum((int64) opaque->btpo_next);
-		values[j++] = Int32GetDatum((int32) opaque->btpo_level);
-		values[j++] = Int32GetDatum((int32) opaque->btpo_flags);
-		values[j++] = Int32GetDatum((int32) PageGetFreeSpace(page));
-		nulls[j++]  = true;				/* merge_id: RFU, always NULL */
-		values[j++] = PointerGetDatum(
-						construct_array_builtin(tids_datum, ntids, TIDOID));
+		values[j++] = Int64GetDatum((int64) btpo_prev_val);
+		values[j++] = Int64GetDatum((int64) btpo_next_val);
+		values[j++] = Int64GetDatum((int64) btpo_level_val);
+		values[j++] = Int32GetDatum((int32) btpo_flags_val);
+		values[j++] = Int32GetDatum((int32) free_size_val);
+		values[j++] = Float8GetDatum(100.0 * free_size_val / BLCKSZ);
+		values[j++] = Int32GetDatum((int32) ntids);
+		if (high_key_hex)
+			values[j++] = CStringGetTextDatum(high_key_hex);
+		else
+			nulls[j++] = true;
+		if (first_val_hex)
+			values[j++] = CStringGetTextDatum(first_val_hex);
+		else
+			nulls[j++] = true;
+		if (last_val_hex)
+			values[j++] = CStringGetTextDatum(last_val_hex);
+		else
+			nulls[j++] = true;
+		nulls[j++] = true;		/* merge_id: RFU, always NULL */
 
-		tuple  = heap_form_tuple(uargs->tupd, values, nulls);
+		if (uargs->show_tids)
+			values[j++] = PointerGetDatum(construct_array_builtin(tids_datum, ntids, TIDOID));
+		else
+			nulls[j++] = true;
+
+		tuple = heap_form_tuple(uargs->tupd, values, nulls);
 		result = HeapTupleGetDatum(tuple);
 
 		uargs->call_cntr++;
 		SRF_RETURN_NEXT(fctx, result);
 	}
 }
-
