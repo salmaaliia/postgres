@@ -103,16 +103,23 @@ LANGUAGE C PARALLEL SAFE;
 --
 CREATE FUNCTION bt_merge_detail(
     IN  relname     text,
-    IN  left_blkno  bigint,
+    IN  left_blkno  int8,
+    IN  show_tids   boolean,
     OUT page_role   text,
-    OUT blkno       bigint,
-    OUT prev_blkno  bigint,
-    OUT next_blkno  bigint,
-    OUT level       integer,
-    OUT btpo_flags  integer,
-    OUT free_size   integer,
-    OUT merge_id    integer,
-    OUT tids        tid[])
+    OUT blkno       int8,
+    OUT btpo_prev   int8,
+    OUT btpo_next   int8,
+    OUT btpo_level  int8,
+    OUT btpo_flags  int4,
+    OUT free_size   int4,
+    OUT pct_free    float8,
+    OUT num_tids    int4,
+    OUT high_key    text,
+    OUT first_val   text,
+    OUT last_val    text,
+    OUT merge_id    int4,
+    OUT tids        tid[]
+)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'bt_merge_detail'
 LANGUAGE C PARALLEL SAFE;
