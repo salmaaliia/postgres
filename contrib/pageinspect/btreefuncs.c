@@ -36,6 +36,9 @@
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pageinspect.h"
+#include "storage/block.h"
+#include "storage/buf.h"
+#include "storage/bufmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/rel.h"
@@ -110,12 +113,13 @@ typedef struct ua_page_items
  */
 typedef struct ua_merge_candidates
 {
-	Oid			relid;			/* index relation OID — reopened each call */
-	BlockNumber current_blkno;	/* current position in the leaf chain */
+	Oid			relid;			
+	BlockNumber current_blkno;	
 	TupleDesc	tupd;
-	float8		threshold;		/* min_pct_threshold as a fraction (0.0–1.0) */
-	int			num_pages;		/* max candidates to return */
-	int			returned;		/* candidates returned so far */
+	float8		merge_candidate_max_pct;		
+	float8		merge_destination_max_pct;		
+	int			num_pages;		
+	int			returned;		
 
 }			ua_merge_candidates;
 
@@ -971,6 +975,84 @@ bt_metap(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(result);
 }
 
+static bool
+bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
+					  BlockNumber right_blkno, BTScanInsert scankey)
+{
+	BTStack		stack;
+	Buffer		found_buf = InvalidBuffer;
+	BlockNumber parent_blkno = InvalidBlockNumber;
+	Buffer		parent_buf;
+	Page		parent_page;
+	BTPageOpaque parent_opaque;
+	OffsetNumber off,
+				maxoff,
+				scan_start,
+				left_off;
+	bool		found_left = false;
+
+	/* Descend the tree to find left's parent. Caller built scankey. */
+	stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ);
+
+	if(BufferIsValid(found_buf))
+		UnlockReleaseBuffer(found_buf);
+
+	if(stack == NULL)
+		return false;
+
+	parent_blkno = stack->bts_blkno;
+	_bt_freestack(stack);
+
+	if(parent_blkno == InvalidBlockNumber)
+		return false;
+
+	parent_buf = ReadBuffer(rel, parent_blkno);
+	LockBuffer(parent_buf, BUFFER_LOCK_SHARE);
+	parent_page = BufferGetPage(parent_buf);
+	parent_opaque = BTPageGetOpaque(parent_page);
+
+	maxoff = PageGetMaxOffsetNumber(parent_page);
+
+	scan_start = P_RIGHTMOST(parent_opaque)? FirstOffsetNumber : OffsetNumberNext(P_HIKEY);
+
+	// need to search the parent to find the left page
+	for(off = scan_start; off <= maxoff; off++){
+		IndexTuple	itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, off));
+
+		BlockNumber child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+		if (child == left_blkno)
+		{
+			left_off = off;
+			found_left = true;
+			break;
+		}
+		
+	}
+	// check if off + 1 in the parent is the right sibling
+	if(found_left){
+		OffsetNumber next_off = OffsetNumberNext(left_off);
+
+		if (next_off <= maxoff)
+		{
+			IndexTuple itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, next_off));
+
+			BlockNumber child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+			if(child == right_blkno){
+				UnlockReleaseBuffer(parent_buf);
+				return true;
+			}
+		}
+		
+		
+	}
+
+	UnlockReleaseBuffer(parent_buf);
+	return false;
+
+}
+
 /*-------------------------------------------------------
  * bt_find_merge_candidates()
  *
@@ -986,8 +1068,9 @@ Datum
 bt_find_merge_candidates(PG_FUNCTION_ARGS)
 {
 	text	   *relname = PG_GETARG_TEXT_PP(0);
-	float8		min_pct_threshold = PG_GETARG_FLOAT8(1);
-	int32		num_pages = PG_GETARG_INT32(2);
+	float8		merge_candidate_max_pct = PG_GETARG_FLOAT8(1);
+	float8		merge_destination_max_pct = PG_GETARG_FLOAT8(2);
+	int32		num_pages = PG_GETARG_INT32(3);
 	Datum		result;
 	FuncCallContext *fctx;
 	MemoryContext mctx;
@@ -1003,6 +1086,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				right_free;
 	Size		left_used,
 				right_used;
+	BTScanInsert scankey;
 	int			j;
 	Datum		values[5];
 	bool		nulls[5];
@@ -1045,7 +1129,8 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		uargs->relid = RelationGetRelid(rel);
 		relation_close(rel, AccessShareLock);
 
-		uargs->threshold = min_pct_threshold / 100.0;
+		uargs->merge_candidate_max_pct = merge_candidate_max_pct / 100.0;
+		uargs->merge_destination_max_pct = merge_destination_max_pct / 100.0;
 		uargs->num_pages = num_pages;
 		uargs->returned = 0;
 
@@ -1116,6 +1201,26 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 			right_page = BufferGetPage(right_buf);
 			right_free = PageGetFreeSpace(right_page);
 
+			/*
+			 * Build the scan key from left's first data tuple while left_buf is
+			 * still pinned.  _bt_mkscankey copies the key columns into private
+			 * palloc'd memory, so it is safe to release the buffer immediately
+			 * after.  We must NOT hold left_buf when calling _bt_search -- it
+			 * would try to lock the same page again, causing a deadlock.
+			 */
+			scankey = NULL;
+			{
+				OffsetNumber first_data_off = P_FIRSTDATAKEY(left_opaque);
+
+				if (first_data_off <= PageGetMaxOffsetNumber(left_page))
+				{
+					IndexTuple	first_itup = (IndexTuple) PageGetItem(left_page,
+																	   PageGetItemId(left_page, first_data_off));
+
+					scankey = _bt_mkscankey(rel, first_itup);
+				}
+			}
+
 			UnlockReleaseBuffer(right_buf);
 			UnlockReleaseBuffer(left_buf);
 
@@ -1125,18 +1230,31 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 			right_used = BLCKSZ - right_free;
 
 			/*
-			 * Merge candidate check: both pages must individually be below
-			 * the threshold AND their combined content must fit within the
-			 * target fillfactor.
+			 * Size check: both pages must individually be below the threshold
+			 * AND their combined content must fit within the target fillfactor.
 			 */
-			if ((float) left_used / BLCKSZ <= uargs->threshold &&
-				(float) right_used / BLCKSZ <= uargs->threshold &&
-				(float) (left_used + right_used) / BLCKSZ <= BTREE_TARGET_FILLFACTOR)
-				break;			/* found a candidate — exit the walk loop */
-		}
+			if ((float) left_used / BLCKSZ <= uargs->merge_candidate_max_pct &&
+				(float) right_used / BLCKSZ <= uargs->merge_candidate_max_pct &&
+				(float) (left_used + right_used) / BLCKSZ <= uargs->merge_destination_max_pct)
+			{
+				/*
+				 * Parent check: left and right must share the same immediate
+				 * parent with adjacent downlinks.
+				 */
+				if (scankey != NULL &&
+					bt_pages_share_parent(rel, left_blkno, right_blkno, scankey))
+				{
+					pfree(scankey);
+					relation_close(rel, AccessShareLock);
+					break;		/* found a valid candidate */
+				}
+			}
 
-		relation_close(rel, AccessShareLock);
+			if (scankey)
+				pfree(scankey);
+		}
 	}
+
 
 	/* Build and return the output row */
 	uargs->returned++;
@@ -1272,7 +1390,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 			ereport(
 					ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("block %u is the rightmost leaf �154� it has no right sibling",
+					 errmsg("block %u is the rightmost leaf it has no right sibling",
 							left_blkno)));
 
 		/*
@@ -1282,7 +1400,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		first_data_off = P_FIRSTDATAKEY(left_opaque);
 		if (first_data_off > PageGetMaxOffsetNumber(left_page))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("leaf page %u is empty �203� cannot determine parent",
+							errmsg("leaf page %u is empty cannot determine parent",
 								   left_blkno)));
 
 		first_itup = (IndexTuple) PageGetItem(
