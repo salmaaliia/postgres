@@ -83,13 +83,14 @@ END;
 --
 CREATE FUNCTION bt_find_merge_candidates(
     IN  relname           text,
-    IN  min_pct_threshold float8 DEFAULT 10.0,
+    IN  merge_candidate_max_pct float8 DEFAULT 10.0,
+    IN  merge_destination_max_pct float8 DEFAULT 90.0,
     IN  num_pages         int4   DEFAULT 1,
     OUT left_blkno        int8,
     OUT right_blkno       int8,
     OUT free_space_left   float8,
     OUT free_space_right  float8,
-    OUT total_free_space  float8)
+    OUT result_free_space  float8)
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'bt_find_merge_candidates'
 LANGUAGE C PARALLEL SAFE;
