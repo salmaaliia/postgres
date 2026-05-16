@@ -83,6 +83,8 @@ typedef BTPageOpaqueData *BTPageOpaque;
 #define BTP_HAS_GARBAGE (1 << 6)	/* page has LP_DEAD tuples (deprecated) */
 #define BTP_INCOMPLETE_SPLIT (1 << 7)	/* right sibling's downlink is missing */
 #define BTP_HAS_FULLXID	(1 << 8)	/* contains BTDeletedPageData */
+#define BTP_MERGED		(1 << 9)	/* This node contain its lift sibling data */
+#define BTP_MERGED_AWAY	(1 << 10)	/* This node was merged into its right sibling */
 
 /*
  * The max allowed value of a cycle ID is a bit less than 64K.  This is
@@ -227,6 +229,8 @@ typedef struct BTMetaPageData
 #define P_HAS_GARBAGE(opaque)	(((opaque)->btpo_flags & BTP_HAS_GARBAGE) != 0)
 #define P_INCOMPLETE_SPLIT(opaque)	(((opaque)->btpo_flags & BTP_INCOMPLETE_SPLIT) != 0)
 #define P_HAS_FULLXID(opaque)	(((opaque)->btpo_flags & BTP_HAS_FULLXID) != 0)
+#define P_MERGED(opaque)		(((opaque)->btpo_flags & BTP_MERGED) != 0)
+#define P_MERGED_AWAY(opaque)	(((opaque)->btpo_flags & BTP_MERGED_AWAY) != 0)
 
 /*
  * BTDeletedPageData is the page contents of a deleted page
@@ -1262,6 +1266,8 @@ extern void _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate);
 extern void _bt_pendingfsm_init(Relation rel, BTVacState *vstate,
 								bool cleanuponly);
 extern void _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate);
+extern bool _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
+                                    BlockNumber right_blkno, BTScanInsert scankey);
 
 /*
  * prototypes for functions in nbtpreprocesskeys.c
@@ -1330,5 +1336,12 @@ extern void btadjustmembers(Oid opfamilyoid,
 extern IndexBuildResult *btbuild(Relation heap, Relation index,
 								 struct IndexInfo *indexInfo);
 extern void _bt_parallel_build_main(dsm_segment *seg, shm_toc *toc);
+
+/**
+ * prototypes for functions in nbmerge.c
+ */
+
+extern int32 _bt_merge_index(Relation rel, float8 min_pct, float8 dest_pct, int32 num_pages);
+
 
 #endif							/* NBTREE_H */

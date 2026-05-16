@@ -53,6 +53,7 @@ PG_FUNCTION_INFO_V1(bt_page_stats);
 PG_FUNCTION_INFO_V1(bt_multi_page_stats);
 PG_FUNCTION_INFO_V1(bt_find_merge_candidates);
 PG_FUNCTION_INFO_V1(bt_merge_detail);
+PG_FUNCTION_INFO_V1(bt_merge);
 
 #define IS_INDEX(r) ((r)->rd_rel->relkind == RELKIND_INDEX)
 #define IS_BTREE(r) ((r)->rd_rel->relam == BTREE_AM_OID)
@@ -1044,8 +1045,6 @@ bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 				return true;
 			}
 		}
-		
-		
 	}
 
 	UnlockReleaseBuffer(parent_buf);
@@ -1201,13 +1200,6 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 			right_page = BufferGetPage(right_buf);
 			right_free = PageGetFreeSpace(right_page);
 
-			/*
-			 * Build the scan key from left's first data tuple while left_buf is
-			 * still pinned.  _bt_mkscankey copies the key columns into private
-			 * palloc'd memory, so it is safe to release the buffer immediately
-			 * after.  We must NOT hold left_buf when calling _bt_search -- it
-			 * would try to lock the same page again, causing a deadlock.
-			 */
 			scankey = NULL;
 			{
 				OffsetNumber first_data_off = P_FIRSTDATAKEY(left_opaque);
@@ -1242,7 +1234,8 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				 * parent with adjacent downlinks.
 				 */
 				if (scankey != NULL &&
-					bt_pages_share_parent(rel, left_blkno, right_blkno, scankey))
+					
+				_bt_pages_share_parent(rel, left_blkno, right_blkno, scankey))
 				{
 					pfree(scankey);
 					relation_close(rel, AccessShareLock);
@@ -1710,4 +1703,50 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		uargs->call_cntr++;
 		SRF_RETURN_NEXT(fctx, result);
 	}
+}
+
+Datum
+bt_merge(PG_FUNCTION_ARGS){
+	text	   *relname = PG_GETARG_TEXT_PP(0);
+	float8		merge_candidate_max_pct = PG_GETARG_FLOAT8(1);
+	float8		merge_destination_max_pct = PG_GETARG_FLOAT8(2);
+	int32		num_pages = PG_GETARG_INT32(3);
+	Datum		result;
+	Relation	rel;
+	RangeVar   *relrv;
+	int32 		merges_performed;
+
+	
+    if (!superuser())
+		ereport(ERROR,
+			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				errmsg("must be superuser to use pageinspect functions")));
+
+    relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
+	rel = relation_openrv(relrv, AccessShareLock);
+
+	if (!IS_INDEX(rel) || !IS_BTREE(rel))
+		ereport(ERROR,
+			(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				errmsg("\"%s\" is not a %s index",
+					RelationGetRelationName(rel), "btree")));
+
+	/*
+	 * Reject attempts to read non-local temporary relations; we would be
+	 * likely to get wrong data since we have no visibility into the owning
+	 * session's local buffers.
+	 */
+	if (RELATION_IS_OTHER_TEMP(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot access temporary tables of other sessions")));
+	
+
+	merges_performed = _bt_merge_index(rel, merge_candidate_max_pct, merge_destination_max_pct, num_pages);
+
+    relation_close(rel, AccessShareLock);
+	
+    
+	PG_RETURN_INT32(merges_performed);
+
 }

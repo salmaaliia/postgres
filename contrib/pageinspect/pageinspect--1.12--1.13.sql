@@ -124,3 +124,14 @@ CREATE FUNCTION bt_merge_detail(
 RETURNS SETOF record
 AS 'MODULE_PATHNAME', 'bt_merge_detail'
 LANGUAGE C PARALLEL SAFE;
+
+CREATE FUNCTION bt_merge(
+    IN  relname                   text,
+    IN  merge_candidate_max_pct   float8 DEFAULT 10.0,
+    IN  merge_destination_max_pct float8 DEFAULT 90.0,
+    IN  num_pages                 int4   DEFAULT 1,
+    OUT merges_performed          int4
+)
+RETURNS int4
+AS 'MODULE_PATHNAME', 'bt_merge'
+LANGUAGE C PARALLEL SAFE;
