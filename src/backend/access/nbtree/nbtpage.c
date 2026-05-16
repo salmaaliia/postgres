@@ -3130,3 +3130,83 @@ _bt_pendingfsm_add(BTVacState *vstate,
 	vstate->pendingpages[vstate->npendingpages].safexid = safexid;
 	vstate->npendingpages++;
 }
+
+bool
+_bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
+					  BlockNumber right_blkno, BTScanInsert scankey)
+{
+	BTStack		stack;
+	Buffer		found_buf = InvalidBuffer;
+	BlockNumber parent_blkno = InvalidBlockNumber;
+	Buffer		parent_buf;
+	Page		parent_page;
+	BTPageOpaque parent_opaque;
+	OffsetNumber off,
+				maxoff,
+				scan_start,
+				left_off;
+	bool		found_left = false;
+
+	/* Descend the tree to find left's parent. Caller built scankey. */
+	stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ);
+
+	if(BufferIsValid(found_buf))
+		UnlockReleaseBuffer(found_buf);
+
+	if(stack == NULL)
+		return false;
+
+	parent_blkno = stack->bts_blkno;
+	_bt_freestack(stack);
+
+	if(parent_blkno == InvalidBlockNumber)
+		return false;
+
+	parent_buf = ReadBuffer(rel, parent_blkno);
+	LockBuffer(parent_buf, BUFFER_LOCK_SHARE);
+	parent_page = BufferGetPage(parent_buf);
+	parent_opaque = BTPageGetOpaque(parent_page);
+
+	maxoff = PageGetMaxOffsetNumber(parent_page);
+
+	scan_start = P_RIGHTMOST(parent_opaque)? FirstOffsetNumber : OffsetNumberNext(P_HIKEY);
+
+	/**
+	 * need to search the parent to find the left page
+	 */ 
+	for(off = scan_start; off <= maxoff; off++){
+		IndexTuple	itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, off));
+
+		BlockNumber child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+		if (child == left_blkno)
+		{
+			left_off = off;
+			found_left = true;
+			break;
+		}
+		
+	}
+	/**
+	 * check if off + 1 in the parent is the right sibling
+	 */
+	if(found_left){
+		OffsetNumber next_off = OffsetNumberNext(left_off);
+
+		if (next_off <= maxoff)
+		{
+			IndexTuple itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, next_off));
+
+			BlockNumber child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+			if(child == right_blkno){
+				UnlockReleaseBuffer(parent_buf);
+				return true;
+			}
+		}
+	}
+
+	UnlockReleaseBuffer(parent_buf);
+	return false;
+
+}
