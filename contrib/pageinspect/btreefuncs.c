@@ -976,81 +976,6 @@ bt_metap(PG_FUNCTION_ARGS)
 	PG_RETURN_DATUM(result);
 }
 
-static bool
-bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
-					  BlockNumber right_blkno, BTScanInsert scankey)
-{
-	BTStack		stack;
-	Buffer		found_buf = InvalidBuffer;
-	BlockNumber parent_blkno = InvalidBlockNumber;
-	Buffer		parent_buf;
-	Page		parent_page;
-	BTPageOpaque parent_opaque;
-	OffsetNumber off,
-				maxoff,
-				scan_start,
-				left_off;
-	bool		found_left = false;
-
-	/* Descend the tree to find left's parent. Caller built scankey. */
-	stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ);
-
-	if(BufferIsValid(found_buf))
-		UnlockReleaseBuffer(found_buf);
-
-	if(stack == NULL)
-		return false;
-
-	parent_blkno = stack->bts_blkno;
-	_bt_freestack(stack);
-
-	if(parent_blkno == InvalidBlockNumber)
-		return false;
-
-	parent_buf = ReadBuffer(rel, parent_blkno);
-	LockBuffer(parent_buf, BUFFER_LOCK_SHARE);
-	parent_page = BufferGetPage(parent_buf);
-	parent_opaque = BTPageGetOpaque(parent_page);
-
-	maxoff = PageGetMaxOffsetNumber(parent_page);
-
-	scan_start = P_RIGHTMOST(parent_opaque)? FirstOffsetNumber : OffsetNumberNext(P_HIKEY);
-
-	// need to search the parent to find the left page
-	for(off = scan_start; off <= maxoff; off++){
-		IndexTuple	itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, off));
-
-		BlockNumber child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
-
-		if (child == left_blkno)
-		{
-			left_off = off;
-			found_left = true;
-			break;
-		}
-		
-	}
-	// check if off + 1 in the parent is the right sibling
-	if(found_left){
-		OffsetNumber next_off = OffsetNumberNext(left_off);
-
-		if (next_off <= maxoff)
-		{
-			IndexTuple itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, next_off));
-
-			BlockNumber child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
-
-			if(child == right_blkno){
-				UnlockReleaseBuffer(parent_buf);
-				return true;
-			}
-		}
-	}
-
-	UnlockReleaseBuffer(parent_buf);
-	return false;
-
-}
 
 /*-------------------------------------------------------
  * bt_find_merge_candidates()
@@ -1078,7 +1003,8 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				right_buf;
 	Page		left_page,
 				right_page;
-	BTPageOpaque left_opaque;
+	BTPageOpaque left_opaque,
+				right_opaque;
 	BlockNumber left_blkno,
 				right_blkno;
 	Size		left_free,
@@ -1185,7 +1111,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 			}
 
 			/* Skip deleted or non-leaf pages */
-			if (P_ISDELETED(left_opaque) || !P_ISLEAF(left_opaque))
+			if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque) || !P_ISLEAF(left_opaque))
 			{
 				uargs->current_blkno = left_opaque->btpo_next;
 				UnlockReleaseBuffer(left_buf);
@@ -1198,7 +1124,16 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 			right_buf = ReadBuffer(rel, right_blkno);
 			LockBuffer(right_buf, BUFFER_LOCK_SHARE);
 			right_page = BufferGetPage(right_buf);
+			right_opaque = BTPageGetOpaque(right_page);
 			right_free = PageGetFreeSpace(right_page);
+
+			if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque) || !P_ISLEAF(right_opaque))
+			{
+				UnlockReleaseBuffer(right_buf);
+				UnlockReleaseBuffer(left_buf);
+				uargs->current_blkno = right_blkno;
+				continue;
+			}
 
 			scankey = NULL;
 			{
@@ -1235,7 +1170,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				 */
 				if (scankey != NULL &&
 					
-				_bt_pages_share_parent(rel, left_blkno, right_blkno, scankey))
+				_bt_pages_share_parent(rel, left_blkno, right_blkno, scankey, NULL))
 				{
 					pfree(scankey);
 					relation_close(rel, AccessShareLock);
@@ -1711,7 +1646,6 @@ bt_merge(PG_FUNCTION_ARGS){
 	float8		merge_candidate_max_pct = PG_GETARG_FLOAT8(1);
 	float8		merge_destination_max_pct = PG_GETARG_FLOAT8(2);
 	int32		num_pages = PG_GETARG_INT32(3);
-	Datum		result;
 	Relation	rel;
 	RangeVar   *relrv;
 	int32 		merges_performed;

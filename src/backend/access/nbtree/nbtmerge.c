@@ -14,6 +14,7 @@ typedef struct BTMergeState
     float8      fillfactor;     /* for re-verification inside mergepage */
     BlockNumber left_blkno;
     BlockNumber right_blkno;
+    BTStack stack;
 } BTMergeState;
 
 
@@ -82,6 +83,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
     int num_pages = 0;
     BTScanInsert scankey;
     BTMergeState mstate;
+    BTStack stack;
 
     mstate.rel = rel;
     mstate.min_threshold = min_threshold / 100.0;
@@ -128,7 +130,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
             return merges_performed;
         }
 
-        if (P_ISDELETED(left_opaque) || !P_ISLEAF(left_opaque)){
+        if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque) || !P_ISLEAF(left_opaque)){
             current_blkno = left_opaque->btpo_next;
             UnlockReleaseBuffer(left_buf);
 			continue;
@@ -140,6 +142,14 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
         LockBuffer(right_buf, BUFFER_LOCK_SHARE);
         right_page = BufferGetPage(right_buf);
         right_opaque = BTPageGetOpaque(right_page);
+
+        if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque) || !P_ISLEAF(right_opaque))
+        {
+            UnlockReleaseBuffer(right_buf);
+            UnlockReleaseBuffer(left_buf);
+            current_blkno = right_blkno;
+            continue;
+        }
 
 
         current_blkno = right_blkno;
@@ -173,10 +183,11 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
                 UnlockReleaseBuffer(left_buf);
 
                 /* 2- must share the same parent */
-                if (_bt_pages_share_parent(rel, left_blkno, right_blkno, scankey))
+                if (_bt_pages_share_parent(rel, left_blkno, right_blkno, scankey, &stack))
                 {
                     mstate.left_blkno  = left_blkno;
                     mstate.right_blkno = right_blkno;
+                    mstate.stack = stack;
 
                     if (_bt_mergepage(mstate))
                     {
@@ -202,12 +213,36 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 
 static bool 
 _bt_mergepage(BTMergeState mstate){
+    BlockNumber parent_blkno;
     Buffer		left_buf,
-				right_buf;
+				right_buf,
+                parent_buf;
 	Page		left_page,
-				right_page;
+				right_page,
+                parent_page;
 	BTPageOpaque left_opaque,
                 right_opaque;
+    BTStack stack;
+    ItemId itemid;
+    IndexTuple	itup, left_itup;
+	BlockNumber child;
+    OffsetNumber next_off;
+    IndexTuple r_hikey = NULL;
+    Size r_hikey_size = 0;
+    OffsetNumber r_start;
+    OffsetNumber r_maxoff;
+    int          n_right;
+    IndexTuple  *r_tuples;
+    Size        *r_sizes;
+    BTPageOpaqueData saved_opaque;
+    OffsetNumber l_start;
+    OffsetNumber l_maxoff;
+    ItemId  hikey_id;
+    Size sz;
+
+
+    stack = mstate.stack;
+    parent_blkno =  stack->bts_blkno;
     
     // lock the relation --> locked in the caller
     // lock the left page  --> need exclusive look for now
@@ -247,11 +282,51 @@ _bt_mergepage(BTMergeState mstate){
         return false;
     }
 
+
+
     
     // recheck the condition again --> size 
 
 
     if(_bt_pages_mergeable(left_page, right_page, mstate.min_threshold, mstate.fillfactor)){
+
+        // re-check if L and R are siblings, as we have the stack 
+
+        /**
+         * I need to get the parent from the stack and recheck that the blkno at the offset 
+         * is still 'L', If it is not I will abort for now, but this be modified in the future
+         */
+
+        parent_buf = ReadBuffer(mstate.rel, parent_blkno);
+        LockBuffer(parent_buf, BT_WRITE);
+        parent_page = BufferGetPage(parent_buf);
+        
+        /* varify tuple at bts_offset in the stack is stil pointing to 'L'*/
+        itemid = PageGetItemId(parent_page, stack->bts_offset);
+        itup = (IndexTuple) PageGetItem(parent_page, itemid);
+        child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+        if(child != mstate.left_blkno){
+            UnlockReleaseBuffer(parent_buf);
+            UnlockReleaseBuffer(right_buf);
+            UnlockReleaseBuffer(left_buf);
+            return false;
+        }
+        
+        left_itup = itup;
+
+        next_off = OffsetNumberNext(stack->bts_offset);
+        itemid = PageGetItemId(parent_page, next_off);
+        itup = (IndexTuple) PageGetItem(parent_page, itemid);
+        child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+        if(child != mstate.right_blkno){
+            UnlockReleaseBuffer(parent_buf);
+            UnlockReleaseBuffer(right_buf);
+            UnlockReleaseBuffer(left_buf);
+            return false;
+        }
+
         
         // Do the actual merge
 
@@ -265,22 +340,11 @@ _bt_mergepage(BTMergeState mstate){
          */
 
         /* Save the high key of R */
-        IndexTuple r_hikey = NULL;
-        Size r_hikey_size = 0;
-        OffsetNumber r_start;
-        OffsetNumber r_maxoff;
-        int          n_right;
-        IndexTuple  *r_tuples;
-        Size        *r_sizes;
-        BTPageOpaqueData saved_opaque;
-        OffsetNumber l_start;
-        OffsetNumber l_maxoff;
-
 
 
         
         if(!P_RIGHTMOST(right_opaque)){
-            ItemId hikey_id = PageGetItemId(right_page, P_HIKEY);
+            hikey_id = PageGetItemId(right_page, P_HIKEY);
             r_hikey_size = ItemIdGetLength(hikey_id);
             r_hikey = (IndexTuple) palloc(r_hikey_size);
             memcpy(r_hikey, PageGetItem(right_page, hikey_id), r_hikey_size);
@@ -295,9 +359,9 @@ _bt_mergepage(BTMergeState mstate){
         r_sizes = palloc(n_right * sizeof(Size));
 
         for(int i = 0; i < n_right; i++){
-            ItemId itemid = PageGetItemId(right_page, r_start + i);
-            Size sz = ItemIdGetLength(itemid);
-            IndexTuple itup = (IndexTuple) PageGetItem(right_page, itemid);
+            itemid = PageGetItemId(right_page, r_start + i);
+            sz = ItemIdGetLength(itemid);
+            itup = (IndexTuple) PageGetItem(right_page, itemid);
 
             r_tuples[i] = (IndexTuple) palloc(sz);
             memcpy(r_tuples[i], itup, sz);
@@ -326,9 +390,9 @@ _bt_mergepage(BTMergeState mstate){
         l_maxoff = PageGetMaxOffsetNumber(left_page);
 
         for(OffsetNumber off = l_start; off <= l_maxoff; off++){
-            ItemId itemid = PageGetItemId(left_page, off);
-            Size sz = ItemIdGetLength(itemid);
-            IndexTuple itup = PageGetItem(left_page, itemid);
+            itemid = PageGetItemId(left_page, off);
+            sz = ItemIdGetLength(itemid);
+            itup = PageGetItem(left_page, itemid);
 
             if(PageAddItem(right_page, itup, sz, InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
                 elog(ERROR, "failed to add high key to merged page");
@@ -344,28 +408,52 @@ _bt_mergepage(BTMergeState mstate){
         pfree(r_tuples);
         pfree(r_sizes);
 
-        MarkBufferDirty(right_buf);
-
-        UnlockReleaseBuffer(right_buf);
 
         /**
          * TODO:
-         * 1-  unlink L from parent and assign its key space to R. 
+         * 1- unlink L from parent and assign its key space to R. 
          * 2- test if this test amcheck
          * 3- select count(a) from tbl where a>= 4 and a<=9;
          * 4- EXPLAIN SELECT count(1) FROM merge_test WHERE id =199;
          * 5- Scan the code to find where BTP_HALF_DEAD is set 
-         * 6- Review the amckec code for the message it says it failing
+         * 6- Review the amcheck code for the message it says it failing
          */
+
+        /* */
+        // we should have the parent (stack maybe)
+        // in parent stack we can get to the tuple for L page.
+        // we can then check if the this tuple have the downlink for L and its next offset have the downlink for R
+        // Use BTreeTupleSetDownLink to make the downlink to L point to R
+        // USe PageIndexTupleDelete to delete the next tuple that used to refer to R
+
+        BTreeTupleSetDownLink(left_itup, mstate.right_blkno);
+        PageIndexTupleDelete(parent_page, next_off);
+
+        /**
+         * The right page have to have an in decator that it was merged, so it will not be merged again later
+         * ex: 
+         * 1 -> 2 -> 3 -> 4 -> 5 -> 6
+         * # in the first pass the merges are (1 to 2), (3 to 4), (5 to 6)
+         * # in the next pass it will skip from 1 to 5 because each pair have at least one half dead page, but when it comes to 6
+         *      it will merge it wil 7 again. 
+         */
+        
 
         /* Mark L half-dead so scans skip it */
         left_opaque->btpo_flags |= BTP_HALF_DEAD;
 
         MarkBufferDirty(left_buf);
+        MarkBufferDirty(right_buf);
+        MarkBufferDirty(parent_buf);
+
+        UnlockReleaseBuffer(parent_buf);
+        UnlockReleaseBuffer(right_buf);
         UnlockReleaseBuffer(left_buf);
         return true;
     }
 
 
+    UnlockReleaseBuffer(right_buf);
+    UnlockReleaseBuffer(left_buf);
     return false;
 }
