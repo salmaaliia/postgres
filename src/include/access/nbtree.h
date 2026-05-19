@@ -1267,7 +1267,7 @@ extern void _bt_pendingfsm_init(Relation rel, BTVacState *vstate,
 								bool cleanuponly);
 extern void _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate);
 extern bool _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
-                                    BlockNumber right_blkno, BTScanInsert scankey);
+                                    BlockNumber right_blkno, BTScanInsert scankey, BTStack *stack_out);
 
 /*
  * prototypes for functions in nbtpreprocesskeys.c
