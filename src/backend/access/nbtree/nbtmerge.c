@@ -165,6 +165,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		right_buf = ReadBuffer(rel, right_blkno);
 		LockBuffer(right_buf, BUFFER_LOCK_SHARE);
 		right_page = BufferGetPage(right_buf);
+
 		right_opaque = BTPageGetOpaque(right_page);
 
 		if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque) ||
@@ -368,8 +369,9 @@ _bt_mergepage(BTMergeState mstate)
 	r_maxoff = PageGetMaxOffsetNumber(right_page);
 	n_right = (r_maxoff >= r_start) ? (r_maxoff - r_start + 1) : 0;
 
-	r_tuples = palloc(n_right * sizeof(IndexTuple));
-	r_sizes = palloc(n_right * sizeof(Size));
+	r_tuples = palloc_array(IndexTuple, n_right);
+	r_sizes = palloc_array(Size, n_right);
+
 
 	for (int i = 0; i < n_right; i++)
 	{
