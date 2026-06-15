@@ -1246,7 +1246,7 @@ index_tuple_data(IndexTuple itup)
  *
  * merge_id is reserved for future use and is always NULL.
  *
- * Usage: SELECT * FROM bt_merge_detail('t1_pkey', 5);
+ * Usage: SELECT * FROM bt_merge_detail('t1_pkey', 5, false);
  *-------------------------------------------------------
  */
 Datum
