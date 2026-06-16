@@ -146,14 +146,15 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		left_page = BufferGetPage(left_buf);
 		left_opaque = BTPageGetOpaque(left_page);
 
+		Assert(P_ISLEAF(left_opaque));
+
 		if (P_RIGHTMOST(left_opaque))
 		{
 			UnlockReleaseBuffer(left_buf);
 			return merges_performed;
 		}
 
-		if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque) ||
-			!P_ISLEAF(left_opaque))
+		if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque))
 		{
 			current_blkno = left_opaque->btpo_next;
 			UnlockReleaseBuffer(left_buf);
@@ -165,11 +166,11 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		right_buf = ReadBuffer(rel, right_blkno);
 		LockBuffer(right_buf, BUFFER_LOCK_SHARE);
 		right_page = BufferGetPage(right_buf);
-
 		right_opaque = BTPageGetOpaque(right_page);
 
-		if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque) ||
-			!P_ISLEAF(right_opaque))
+		Assert(P_ISLEAF(right_opaque));
+
+		if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque))
 		{
 			UnlockReleaseBuffer(right_buf);
 			UnlockReleaseBuffer(left_buf);
@@ -277,14 +278,16 @@ _bt_mergepage(BTMergeState mstate)
 	LockBuffer(left_buf, BT_WRITE);
 	left_page = BufferGetPage(left_buf);
 	left_opaque = BTPageGetOpaque(left_page);
+	Assert(P_ISLEAF(left_opaque));
 
 	right_buf = ReadBuffer(mstate.rel, mstate.right_blkno);
 	LockBuffer(right_buf, BT_WRITE);
 	right_page = BufferGetPage(right_buf);
 	right_opaque = BTPageGetOpaque(right_page);
+	Assert(P_ISLEAF(right_opaque));
 
 	/* Re-verify left under exclusive lock. */
-	if (P_ISDELETED(left_opaque) || !P_ISLEAF(left_opaque))
+	if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque))
 	{
 		UnlockReleaseBuffer(right_buf);
 		UnlockReleaseBuffer(left_buf);
@@ -300,7 +303,7 @@ _bt_mergepage(BTMergeState mstate)
 	}
 
 	/* Re-verify right under exclusive lock. */
-	if (P_ISDELETED(right_opaque) || !P_ISLEAF(right_opaque))
+	if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque))
 	{
 		UnlockReleaseBuffer(right_buf);
 		UnlockReleaseBuffer(left_buf);
