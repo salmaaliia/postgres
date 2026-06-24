@@ -46,9 +46,10 @@ static bool _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 static Buffer _bt_lock_and_validate_left(Relation rel, BlockNumber *blkno,
 										 BlockNumber lastcurrblkno);
 static bool _bt_endpoint(IndexScanDesc scan, ScanDirection dir);
-static void _bt_readmergedawaypage(IndexScanDesc scan, BlockNumber blkno);
+// static void _bt_readmergedawaypage(IndexScanDesc scan, BlockNumber blkno);
 static void _bt_removeduplicates(IndexScanDesc scan);
-
+static void _bt_copymergedawaydata(IndexScanDesc scan);
+static int compare(const void *a, const void *b);
 
 /*
  *	_bt_drop_lock_and_maybe_pin()
@@ -1852,8 +1853,6 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 {
 	Relation	rel = scan->indexRelation;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	BlockNumber left_blkno;
-	bool forwardScanNeedRecover = false;
 
 	Assert(so->currPos.currPage == lastcurrblkno || seized);
 	Assert(!(blkno == P_NONE && seized));
@@ -1872,7 +1871,6 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 	{
 		Page		page;
 		BTPageOpaque opaque;
-		forwardScanNeedRecover = false;
 
 		if (blkno == P_NONE ||
 			(ScanDirectionIsForward(dir) ?
@@ -1921,27 +1919,29 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 		lastcurrblkno = blkno;
 		
 		
-		if(P_MERGED_AWAY(opaque))
+		if (P_MERGED_AWAY(opaque))
 		{
-			if(ScanDirectionIsForward(dir))
+			if (ScanDirectionIsForward(dir))
 			{
-				// save a state that we have passed this pages already and then go next
+				/* Save state indicating we passed a merged away page and proceed to the next page */
 				/* TODO: we need to clear the flag in this future (but when?). 
-				* We may need the blkno or xid 
-				*/
+				 * We may need the blkno or xid 
+				 */
 				so->hitMergedAwayPage = true;
 				blkno = opaque->btpo_next;
-			}else
+			}
+			else
 			{
 			}
 		}
-		else if(P_MERGED(opaque))
+		else if (P_MERGED(opaque))
 		{
-			if(ScanDirectionIsForward(dir))
+			if (ScanDirectionIsForward(dir))
 			{
-				// case 1: we passed the BTP_MERGED_AWAY page already (and that merged away page we have its blkno saved (will do this part later))
-				// We read this page as a normal page
-				if(so->hitMergedAwayPage)
+				/* Case 1: We passed the BTP_MERGED_AWAY page already and that merged away page we have its blkno saved (will do this part later).
+				 * We read this page as a normal page.
+				 */
+				if (so->hitMergedAwayPage)
 				{
 					if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque), seized))
 						break;
@@ -1949,23 +1949,32 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 				}
 				else
 				{
-				/* case 2: we read left page before merge so we need to recover */
-				/* check the blkno of the merged away page saved in 'so' with the one save in this page, 
-				* If they match, it means we have the data saved and we do not need to go back to L (this will be implemented later),
-				* This is how splits are handled
-				*/ 
+					/* Case 2: We read the left page before it was merged so we need to recover */
+					/* Check the blkno of the merged away page saved in 'so' with the one saved in this page.
+					 * If they match, it means we have the data saved and we do not need to go back to L (this will be implemented later).
+					 * This is how splits are handled.
+					 */
+					
+					/* Before reading the right page, copy the current position items into mergedAwayTids */
+					_bt_copymergedawaydata(scan);
+
 					if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque), seized))
 					{
-						left_blkno = so->currPos.prevPage;
-						forwardScanNeedRecover = true;
-						break;
+						_bt_removeduplicates(scan);
 
+						/* Check if there are matching items left after filtering out duplicates */
+						if (so->currPos.lastItem >= so->currPos.firstItem)
+						{
+							/* this will be changed later to handle splits */
+							so->hitMergedAwayPage = false;
+							break;
+						}
 					}
 					blkno = so->currPos.nextPage;
 				}
-			}else
+			}
+			else
 			{
-
 			}
 		}
 
@@ -2011,31 +2020,42 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 	Assert(BTScanPosIsPinned(so->currPos));
 	_bt_drop_lock_and_maybe_pin(rel, so);
 
-	/**
-	 * Doing the forward scan duplicates handling here
-	 */
-
-	if(forwardScanNeedRecover){		
-		_bt_readmergedawaypage(scan, left_blkno);
-
-		_bt_removeduplicates(scan);
-
-		// this will be changed later
-		so->hitMergedAwayPage = false;
-	}
-
 	return true;
 }
 
-static void _bt_readmergedawaypage(IndexScanDesc scan, BlockNumber blkno){
+/* Copy heap TIDs from current scan position of the left page before it gets overwritten */
+static void
+_bt_copymergedawaydata(IndexScanDesc scan)
+{
+	BTScanOpaque so = (BTScanOpaque) scan->opaque;
+	int firstItem = so->currPos.firstItem;
+	int lastItem = so->currPos.lastItem;
+	ItemPointerData item;
+
+	so->nMergedAwayTids = 0;
+
+	for (int i = firstItem; i <= lastItem; i++)
+	{
+		item = so->currPos.items[i].heapTid;
+		so->mergedAwayTids[so->nMergedAwayTids++] = item;
+	}
+
+	if (so->nMergedAwayTids > 1)
+		qsort(so->mergedAwayTids, so->nMergedAwayTids, sizeof(ItemPointerData), compare);
+}
+
+/* Read a merged away page to extract all of its heap TIDs */
+static void
+_bt_readmergedawaypage(IndexScanDesc scan, BlockNumber blkno)
+{
 	Relation	rel = scan->indexRelation;
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	Buffer buf;
-	Page page;
+	Buffer		buf;
+	Page		page;
 	BTPageOpaque opaque;
-	OffsetNumber 	minoff,
-					maxoff,
-					offnum;
+	OffsetNumber minoff,
+				maxoff,
+				offnum;
 	int 		n;
 	ItemId  iid;
 	// ItemId	hikey_id;
@@ -2044,7 +2064,6 @@ static void _bt_readmergedawaypage(IndexScanDesc scan, BlockNumber blkno){
 	bool ignore_killed_tuples = scan->ignore_killed_tuples;
 
 
-	/* Lock L */
 	buf = _bt_getbuf(rel, blkno, BT_READ);
 	page = BufferGetPage(buf);
 	opaque = BTPageGetOpaque(page);
@@ -2064,10 +2083,9 @@ static void _bt_readmergedawaypage(IndexScanDesc scan, BlockNumber blkno){
 	maxoff = PageGetMaxOffsetNumber(page);
 
 	so->nMergedAwayTids = 0;
-
 	offnum = minoff;
-
-	while(offnum <= maxoff)
+	
+	while (offnum <= maxoff)
 	{
 		iid = PageGetItemId(page, offnum);
 
@@ -2101,30 +2119,38 @@ static void _bt_readmergedawaypage(IndexScanDesc scan, BlockNumber blkno){
 	
 }
 
+/* Compare function for sorting and searching heap TIDs */
 static int
-compare(const void *a, const void *b){
+compare(const void *a, const void *b)
+{
 	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
 }
 
-static void _bt_removeduplicates(IndexScanDesc scan)
+/* Remove duplicate heap TIDs from current scan position if they match mergedAwayTids */
+static void
+_bt_removeduplicates(IndexScanDesc scan)
 {
 	BTScanOpaque so = (BTScanOpaque) scan->opaque;
 	int firstItem = so->currPos.firstItem;
 	int lastItem = so->currPos.lastItem;
 	int dest = firstItem;
 	ItemPointerData *item,
-					*found;
+			   *found;
 
-	for(int i = firstItem; i <= lastItem; i++)
+	/* Filter out items whose heap TIDs are in mergedAwayTids list */
+	for (int i = firstItem; i <= lastItem; i++)
 	{
-		item  = &so->currPos.items[i].heapTid;
-		
-		found = (ItemPointerData *)bsearch(item, so->mergedAwayTids, so->nMergedAwayTids, sizeof(ItemPointerData), compare);
+		item = &so->currPos.items[i].heapTid;
 
-		if(found){
+		found = (ItemPointerData *) bsearch(item, so->mergedAwayTids, so->nMergedAwayTids, sizeof(ItemPointerData), compare);
+
+		if (found)
+		{
+			/* Skip duplicate item */
 			continue;
 		}
 
+		/* Retain non duplicate item */
 		so->currPos.items[dest] = so->currPos.items[i];
 		dest++;
 	}

@@ -374,6 +374,11 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	 */
 	so->currTuples = so->markTuples = NULL;
 
+	/* Initialize merge fields */
+	so->hitMergedAwayPage = false;
+	so->nMergedAwayTids = 0;
+	so->mergedAwayBlkno = InvalidBlockNumber;
+
 	scan->xs_itupdesc = RelationGetDescr(rel);
 
 	scan->opaque = so;
@@ -426,6 +431,10 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->oppositeDirCheck = false;
 	BTScanPosUnpinIfPinned(so->markPos);
 	BTScanPosInvalidate(so->markPos);
+
+	so->hitMergedAwayPage = false;
+	so->nMergedAwayTids = 0;
+	so->mergedAwayBlkno = InvalidBlockNumber;
 
 	/*
 	 * Allocate tuple workspace arrays, if needed for an index-only scan and
