@@ -232,6 +232,24 @@ typedef struct BTMetaPageData
 #define P_MERGED(opaque)		(((opaque)->btpo_flags & BTP_MERGED) != 0)
 #define P_MERGED_AWAY(opaque)	(((opaque)->btpo_flags & BTP_MERGED_AWAY) != 0)
 
+static inline void
+BTPageSetMerged(Page page){
+	BTPageOpaque opaque;
+
+	opaque = BTPageGetOpaque(page);
+	opaque->btpo_flags |= BTP_MERGED;
+
+}
+
+static inline void
+BTPageSetMergedAway(Page page){
+	BTPageOpaque opaque;
+
+	opaque = BTPageGetOpaque(page);
+	opaque->btpo_flags |= BTP_MERGED_AWAY;
+}
+
+
 /*
  * BTDeletedPageData is the page contents of a deleted page
  */
@@ -1096,6 +1114,16 @@ typedef struct BTScanOpaqueData
 	/* keep these last in struct for efficiency */
 	BTScanPosData currPos;		/* current position data */
 	BTScanPosData markPos;		/* marked position, if any */
+
+	/* Merge information */
+	/* For forward scan */
+	bool hitMergedAwayPage; /* Scan saw MERGED_AWAY page after merge abd skipped it */
+
+	ItemPointerData mergedAwayTids[MaxTIDsPerBTreePage];  /* palloc'd array of TIDs from L */
+	int             nMergedAwayTids;  /* number of TIDs in the array */
+	BlockNumber     mergedAwayBlkno;  /* blkno of L (BTP_MERGED_AWAY page) */
+	IndexTuple      mergedAwayHiKey;  /* palloc'd copy of L's high key */
+
 } BTScanOpaqueData;
 
 typedef BTScanOpaqueData *BTScanOpaque;

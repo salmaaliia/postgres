@@ -21,6 +21,7 @@
 #include "common/int.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
+#include "utils/injection_point.h"
 
 
 typedef struct BTMergeState
@@ -107,9 +108,11 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 	Buffer		left_buf,
 				right_buf;
 	Page		left_page,
-				right_page;
+				right_page,
+				temp_page;
 	BTPageOpaque left_opaque,
-				right_opaque;
+				right_opaque,
+				temp_opaque;
 	BlockNumber left_blkno,
 				right_blkno,
 				current_blkno,
@@ -124,11 +127,14 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 	mstate.min_threshold = min_threshold / 100.0;
 	mstate.fillfactor = fillfactor / 100.0;
 
-	/* Start from the leftmost leaf page. */
+	/* Start from the second leftmost leaf page. */
 	{
 		Buffer		endpoint_buf = _bt_get_endpoint(rel, 0, false);
 
 		current_blkno = BufferGetBlockNumber(endpoint_buf);
+		temp_page = BufferGetPage(endpoint_buf);
+		temp_opaque = BTPageGetOpaque(temp_page);
+		current_blkno = temp_opaque->btpo_next;
 		UnlockReleaseBuffer(endpoint_buf);
 	}
 
@@ -279,6 +285,8 @@ _bt_mergepage(BTMergeState mstate)
 	left_page = BufferGetPage(left_buf);
 	left_opaque = BTPageGetOpaque(left_page);
 	Assert(P_ISLEAF(left_opaque));
+
+	INJECTION_POINT("after_left_lock", NULL);
 
 	right_buf = ReadBuffer(mstate.rel, mstate.right_blkno);
 	LockBuffer(right_buf, BT_WRITE);
@@ -433,7 +441,10 @@ _bt_mergepage(BTMergeState mstate)
 	PageIndexTupleDelete(parent_page, next_off);
 
 	/* Mark L half-dead so concurrent scans skip it. */
-	left_opaque->btpo_flags |= BTP_HALF_DEAD;
+	// left_opaque->btpo_flags |= BTP_HALF_DEAD;
+	
+	BTPageSetMerged(right_page);
+	BTPageSetMergedAway(left_page);
 
 	MarkBufferDirty(left_buf);
 	MarkBufferDirty(right_buf);
