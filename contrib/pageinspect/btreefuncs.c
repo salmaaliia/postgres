@@ -196,6 +196,8 @@ GetBTPageStatistics(BlockNumber blkno, Buffer buffer, BTPageStat *stat)
 	}
 	else if (P_IGNORE(opaque))
 		stat->type = 'e';
+	else if(P_MERGED_AWAY(opaque))
+		stat->type = 'm';
 	else if (P_ISLEAF(opaque))
 		stat->type = 'l';
 	else if (P_ISROOT(opaque))
@@ -1042,12 +1044,14 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		uargs = palloc_object(ua_merge_candidates);
 
 		/*
-		 * Start at the leftmost leaf page.
+		 * Start at the second leftmost leaf page.
 		 */
 		{
 			Buffer		endpoint_buf = _bt_get_endpoint(rel, 0, false);
-
-			uargs->current_blkno = BufferGetBlockNumber(endpoint_buf);
+			Page temp_page = BufferGetPage(endpoint_buf);
+		    BTPageOpaque temp_opaque = BTPageGetOpaque(temp_page);
+			uargs->current_blkno = temp_opaque->btpo_next;
+			// elog(WARNING, "Hello from bt_find_merge_candidates");
 			UnlockReleaseBuffer(endpoint_buf);
 		}
 
