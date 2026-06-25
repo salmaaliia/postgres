@@ -1116,13 +1116,12 @@ typedef struct BTScanOpaqueData
 	BTScanPosData markPos;		/* marked position, if any */
 
 	/* Merge information */
-	/* For forward scan */
-	bool hitMergedAwayPage; /* Scan saw MERGED_AWAY page after merge abd skipped it */
+	bool skipMergeRecovery; 
+	bool needMergeRecovery;
 
-	ItemPointerData mergedAwayTids[MaxTIDsPerBTreePage];  /* palloc'd array of TIDs from L */
-	int             nMergedAwayTids;  /* number of TIDs in the array */
+	ItemPointerData savedMergeTids[MaxTIDsPerBTreePage];
+	int             nSavedMergeTids;  /* number of TIDs in the array */
 	BlockNumber     mergedAwayBlkno;  /* blkno of L (BTP_MERGED_AWAY page) */
-	IndexTuple      mergedAwayHiKey;  /* palloc'd copy of L's high key */
 
 } BTScanOpaqueData;
 

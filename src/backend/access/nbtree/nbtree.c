@@ -375,8 +375,9 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	so->currTuples = so->markTuples = NULL;
 
 	/* Initialize merge fields */
-	so->hitMergedAwayPage = false;
-	so->nMergedAwayTids = 0;
+	so->skipMergeRecovery = false;
+	so->needMergeRecovery = false;
+	so->nSavedMergeTids = 0;
 	so->mergedAwayBlkno = InvalidBlockNumber;
 
 	scan->xs_itupdesc = RelationGetDescr(rel);
@@ -432,8 +433,9 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	BTScanPosUnpinIfPinned(so->markPos);
 	BTScanPosInvalidate(so->markPos);
 
-	so->hitMergedAwayPage = false;
-	so->nMergedAwayTids = 0;
+	so->skipMergeRecovery = false;
+	so->needMergeRecovery = false;
+	so->nSavedMergeTids = 0;
 	so->mergedAwayBlkno = InvalidBlockNumber;
 
 	/*
