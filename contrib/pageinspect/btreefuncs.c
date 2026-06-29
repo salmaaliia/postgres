@@ -1114,13 +1114,16 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				SRF_RETURN_DONE(fctx);
 			}
 
-			/* Skip deleted or non-leaf pages */
-			if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque) || !P_ISLEAF(left_opaque))
+			/* Skip deleted, half-dead, and already-merged pages. */
+			if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
+					|| P_MERGED(left_opaque) || P_MERGED_AWAY(left_opaque))
 			{
 				uargs->current_blkno = left_opaque->btpo_next;
 				UnlockReleaseBuffer(left_buf);
 				continue;
 			}
+
+			Assert(P_ISLEAF(left_opaque));
 
 			/* Lock couple: acquire right BEFORE releasing left */
 			right_blkno = left_opaque->btpo_next;
@@ -1131,13 +1134,17 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 			right_opaque = BTPageGetOpaque(right_page);
 			right_free = PageGetFreeSpace(right_page);
 
-			if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque) || !P_ISLEAF(right_opaque))
+			/* R is unusable; skip directly past it using its btpo_next. */
+			if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
+					|| P_MERGED(right_opaque) || P_MERGED_AWAY(right_opaque))
 			{
+				uargs->current_blkno = right_opaque->btpo_next;
 				UnlockReleaseBuffer(right_buf);
 				UnlockReleaseBuffer(left_buf);
-				uargs->current_blkno = right_blkno;
 				continue;
 			}
+
+			Assert(P_ISLEAF(right_opaque));
 
 			scankey = NULL;
 			{
@@ -1152,10 +1159,11 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				}
 			}
 
+			/* L is examined; slide the window to R as the default next-left. */
+			uargs->current_blkno = right_blkno;
+
 			UnlockReleaseBuffer(right_buf);
 			UnlockReleaseBuffer(left_buf);
-
-			uargs->current_blkno = right_blkno;
 
 			left_used = BLCKSZ - left_free;
 			right_used = BLCKSZ - right_free;
