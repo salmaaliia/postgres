@@ -1862,7 +1862,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 	Assert(!(blkno == P_NONE && seized));
 	Assert(!BTScanPosIsPinned(so->currPos));
 
-	if (strcmp(RelationGetRelationName(rel), "merge_test_idx") == 0 && ScanDirectionIsForward(dir) && blkno != 2)
+	if (strcmp(RelationGetRelationName(rel), "merge_test_idx") == 0 && ScanDirectionIsForward(dir) && blkno == 4)
 	{
 		INJECTION_POINT("before_read_next_page", NULL);
 	}
@@ -2133,6 +2133,9 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 	return true;
 }
 
+/**
+ * TODO: add comments for this function 
+ */
 static void
 _bt_find_merge_tail(IndexScanDesc scan, BlockNumber m_blkno, BlockNumber *blkno,
 				 BlockNumber *lastcurrblkno)

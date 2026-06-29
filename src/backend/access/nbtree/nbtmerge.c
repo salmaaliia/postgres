@@ -116,7 +116,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 	BlockNumber left_blkno,
 				right_blkno,
 				current_blkno,
-				potential_blkno;
+				r_right_blkno;
 	int32		merges_performed = 0;
 	int			num_pages = 0;
 	BTScanInsert scankey;
@@ -152,20 +152,21 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		left_page = BufferGetPage(left_buf);
 		left_opaque = BTPageGetOpaque(left_page);
 
-		Assert(P_ISLEAF(left_opaque));
-
 		if (P_RIGHTMOST(left_opaque))
 		{
 			UnlockReleaseBuffer(left_buf);
 			return merges_performed;
 		}
 
-		if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque))
+		if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
+				|| P_MERGED(left_opaque) || P_MERGED_AWAY(left_opaque))
 		{
 			current_blkno = left_opaque->btpo_next;
 			UnlockReleaseBuffer(left_buf);
 			continue;
 		}
+
+		Assert(P_ISLEAF(left_opaque));
 
 		/* Pin and share-lock the right candidate. */
 		right_blkno = left_opaque->btpo_next;
@@ -174,20 +175,23 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		right_page = BufferGetPage(right_buf);
 		right_opaque = BTPageGetOpaque(right_page);
 
-		Assert(P_ISLEAF(right_opaque));
-
-		if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque))
+		if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
+				|| P_MERGED(right_opaque) || P_MERGED_AWAY(right_opaque))
 		{
+			current_blkno = right_opaque->btpo_next;
 			UnlockReleaseBuffer(right_buf);
 			UnlockReleaseBuffer(left_buf);
-			current_blkno = right_blkno;
 			continue;
 		}
 
-		/* temporary */
-		current_blkno = right_blkno;
-		potential_blkno = right_opaque->btpo_next;
+		Assert(P_ISLEAF(right_opaque));
+
+		/* Save R's right sibling while we still hold the share lock on R. */
+		r_right_blkno = right_opaque->btpo_next;
+
+		/* L is examined; slide the window to R as the default next-left. */
 		num_pages++;
+		current_blkno = right_blkno;
 
 		scankey = _bt_merge_mkscankey(rel, left_page, left_opaque);
 
@@ -196,11 +200,15 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 			scankey != NULL)
 		{
 			/*
+			 * R is also consumed; advance past it.
+			 *
 			 * Drop share locks before calling _bt_pages_share_parent.
 			 * _bt_search descends to the left leaf and will try to lock it,
 			 * which would fail an assertion if we already hold a lock on it.
 			 * The scankey is a palloc'd copy so releasing here is safe.
 			 */
+			num_pages++;
+			current_blkno = r_right_blkno;
 			UnlockReleaseBuffer(right_buf);
 			UnlockReleaseBuffer(left_buf);
 
@@ -212,18 +220,14 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 				mstate.stack = stack;
 
 				if (_bt_mergepage(mstate))
-				{
-					current_blkno = potential_blkno;
-					num_pages++;
 					merges_performed++;
-				}
 			}
 
 			pfree(scankey);
 			continue;
 		}
 
-		/* Not a candidate — move on. */
+		/* Pages don't qualify; current_blkno already points at R. */
 		UnlockReleaseBuffer(right_buf);
 		UnlockReleaseBuffer(left_buf);
 		if (scankey)
@@ -295,7 +299,8 @@ _bt_mergepage(BTMergeState mstate)
 	Assert(P_ISLEAF(right_opaque));
 
 	/* Re-verify left under exclusive lock. */
-	if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque))
+	if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
+			|| P_MERGED(left_opaque) || P_MERGED_AWAY(left_opaque))
 	{
 		UnlockReleaseBuffer(right_buf);
 		UnlockReleaseBuffer(left_buf);
@@ -311,7 +316,8 @@ _bt_mergepage(BTMergeState mstate)
 	}
 
 	/* Re-verify right under exclusive lock. */
-	if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque))
+	if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
+			|| P_MERGED(right_opaque) || P_MERGED_AWAY(right_opaque))
 	{
 		UnlockReleaseBuffer(right_buf);
 		UnlockReleaseBuffer(left_buf);
@@ -439,9 +445,6 @@ _bt_mergepage(BTMergeState mstate)
 	 */
 	BTreeTupleSetDownLink(left_itup, mstate.right_blkno);
 	PageIndexTupleDelete(parent_page, next_off);
-
-	/* Mark L half-dead so concurrent scans skip it. */
-	// left_opaque->btpo_flags |= BTP_HALF_DEAD;
 	
 	BTPageSetMerged(right_page);
 	BTPageSetMergedAway(left_page);
