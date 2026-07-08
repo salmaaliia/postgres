@@ -1999,10 +1999,15 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 				/* Save state indicating we passed a merged away page and proceed to the next page */
 				elog(LOG, "BTREE_MERGE_TRACE: path 1 (FWD SCAN: Hit Tombstone, setting skipMergeRecovery)");
 				so->skipMergeRecovery = true;
-				blkno = opaque->btpo_next; 
+				so->mergedAwayBlkno = blkno;
+				blkno = opaque->btpo_next;
 			}
 			else
 			{
+				if(so->mergedAwayBlkno != blkno){
+					so->skipMergeRecovery = false;
+					so->needMergeRecovery = false;
+				}
 				/* 
 				 * BACKWARD SCAN: Tombstone (BTP_MERGED_AWAY) 
 				 */
@@ -2043,12 +2048,10 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 		{
 			if (ScanDirectionIsForward(dir))
 			{
-				/**
-				 * X <--> L <--> R
-				 * TODO: after skipping MA pade and before we reach R(M), if L got deleted, flags reset 
-				 * then R got merged with X, when the scan steps into R it need to recover.
-				 * We need to detect this situation by checking the left sibling of R matches the MA page of this group
-				 */
+				if(BTMergedPageGetMABlkno(page) != so->mergedAwayBlkno){
+					so->skipMergeRecovery = false;
+					so->mergedAwayBlkno = BTMergedPageGetMABlkno(page);
+				}
 				/* Case 1: We passed the BTP_MERGED_AWAY page already and that merged away page we have its blkno saved (will do this part later).
 				 * We read this page as a normal page.
 				 */
@@ -2089,6 +2092,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 			}
 			else
 			{
+				so->mergedAwayBlkno = BTMergedPageGetMABlkno(page);
 				/* 
 				 * BACKWARD SCAN: Merged Page (BTP_MERGED) 
 				 */

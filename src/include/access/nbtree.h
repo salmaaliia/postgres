@@ -249,6 +249,25 @@ BTPageSetMergedAway(Page page){
 	opaque->btpo_flags |= BTP_MERGED_AWAY;
 }
 
+/*
+ * Accessors for the MERGED_AWAY block number stored on BTP_MERGED pages.
+ *
+ * We store the block number of the corresponding BTP_MERGED_AWAY (tombstone)
+ * page in pd_prune_xid, which is a 4-byte field in PageHeaderData that is
+ * explicitly documented as "currently unused in index pages" (see bufpage.h).
+ * This is the only available 4-byte slot on a MERGED page that may be
+ * completely full of index tuples -- we cannot extend the special area on
+ * a full page, and the item content area is occupied by live tuples.
+ *
+ * Only valid when P_MERGED(opaque) is true.  All other B-tree pages keep
+ * pd_prune_xid at its default value of InvalidTransactionId (0).
+ */
+#define BTMergedPageGetMABlkno(page) \
+	((BlockNumber) ((PageHeader)(page))->pd_prune_xid)
+
+#define BTMergedPageSetMABlkno(page, blkno) \
+	(((PageHeader)(page))->pd_prune_xid = (TransactionId)(blkno))
+
 
 /*
  * BTDeletedPageData is the page contents of a deleted page

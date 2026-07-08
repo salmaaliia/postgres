@@ -447,7 +447,19 @@ _bt_mergepage(BTMergeState mstate)
 	PageIndexTupleDelete(parent_page, next_off);
 	
 	BTPageSetMerged(right_page);
+	/*
+	 * Record the block number of the MERGED_AWAY (tombstone) page on every
+	 * MERGED page.  The backward scan uses this to verify it has found the
+	 * correct tombstone for this merge group, which is needed to detect a
+	 * race where a new merge replaces the original tombstone while the scan
+	 * is between the MERGED page and the old tombstone.
+	 *
+	 * We store it in pd_prune_xid, which is unused in index pages (see the
+	 * BTMergedPageSetMABlkno macro in nbtree.h for full justification).
+	 */
+	BTMergedPageSetMABlkno(right_page, mstate.left_blkno);
 	BTPageSetMergedAway(left_page);
+
 
 	MarkBufferDirty(left_buf);
 	MarkBufferDirty(right_buf);
