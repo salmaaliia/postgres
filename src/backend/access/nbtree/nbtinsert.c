@@ -1784,7 +1784,7 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	 * now so that backward scans can verify the correct tombstone for both
 	 * halves of the split merge group.
 	 */
-	if (P_MERGED(oopaque))
+	if (P_ISMERGED(oopaque))
 		BTMergedPageSetMABlkno(rightpage, BTMergedPageGetMABlkno(origpage));
 
 	/*

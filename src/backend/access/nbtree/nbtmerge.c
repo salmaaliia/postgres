@@ -22,7 +22,7 @@
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
 #include "utils/injection_point.h"
-
+#include "storage/predicate.h"
 
 typedef struct BTMergeState
 {
@@ -159,7 +159,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		}
 
 		if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
-				|| P_MERGED(left_opaque) || P_MERGED_AWAY(left_opaque))
+				|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
 		{
 			current_blkno = left_opaque->btpo_next;
 			UnlockReleaseBuffer(left_buf);
@@ -176,7 +176,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		right_opaque = BTPageGetOpaque(right_page);
 
 		if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
-				|| P_MERGED(right_opaque) || P_MERGED_AWAY(right_opaque))
+				|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
 		{
 			current_blkno = right_opaque->btpo_next;
 			UnlockReleaseBuffer(right_buf);
@@ -253,6 +253,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 static bool
 _bt_mergepage(BTMergeState mstate)
 {
+	Relation rel = mstate.rel;
 	BlockNumber parent_blkno;
 	Buffer		left_buf,
 				right_buf,
@@ -280,11 +281,12 @@ _bt_mergepage(BTMergeState mstate)
 	OffsetNumber l_maxoff;
 	ItemId		hikey_id;
 	Size		sz;
+	FullTransactionId safemergexid;
 
 	stack = mstate.stack;
 	parent_blkno = stack->bts_blkno;
 
-	left_buf = ReadBuffer(mstate.rel, mstate.left_blkno);
+	left_buf = ReadBuffer(rel, mstate.left_blkno);
 	LockBuffer(left_buf, BT_WRITE);
 	left_page = BufferGetPage(left_buf);
 	left_opaque = BTPageGetOpaque(left_page);
@@ -292,7 +294,7 @@ _bt_mergepage(BTMergeState mstate)
 
 	INJECTION_POINT("after_left_lock", NULL);
 
-	right_buf = ReadBuffer(mstate.rel, mstate.right_blkno);
+	right_buf = ReadBuffer(rel, mstate.right_blkno);
 	LockBuffer(right_buf, BT_WRITE);
 	right_page = BufferGetPage(right_buf);
 	right_opaque = BTPageGetOpaque(right_page);
@@ -300,7 +302,7 @@ _bt_mergepage(BTMergeState mstate)
 
 	/* Re-verify left under exclusive lock. */
 	if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
-			|| P_MERGED(left_opaque) || P_MERGED_AWAY(left_opaque))
+			|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
 	{
 		UnlockReleaseBuffer(right_buf);
 		UnlockReleaseBuffer(left_buf);
@@ -317,7 +319,7 @@ _bt_mergepage(BTMergeState mstate)
 
 	/* Re-verify right under exclusive lock. */
 	if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
-			|| P_MERGED(right_opaque) || P_MERGED_AWAY(right_opaque))
+			|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
 	{
 		UnlockReleaseBuffer(right_buf);
 		UnlockReleaseBuffer(left_buf);
@@ -339,7 +341,7 @@ _bt_mergepage(BTMergeState mstate)
 	 * modified between our scan and now, we bail out rather than risk
 	 * corrupting the index.
 	 */
-	parent_buf = ReadBuffer(mstate.rel, parent_blkno);
+	parent_buf = ReadBuffer(rel, parent_blkno);
 	LockBuffer(parent_buf, BT_WRITE);
 	parent_page = BufferGetPage(parent_buf);
 
@@ -439,6 +441,8 @@ _bt_mergepage(BTMergeState mstate)
 	pfree(r_tuples);
 	pfree(r_sizes);
 
+	PredicateLockPageCombine(rel, mstate.left_blkno, mstate.right_blkno);
+
 	/*
 	 * Update the parent: redirect L's downlink to R, then delete R's
 	 * now-redundant downlink entry.
@@ -458,7 +462,9 @@ _bt_mergepage(BTMergeState mstate)
 	 * BTMergedPageSetMABlkno macro in nbtree.h for full justification).
 	 */
 	BTMergedPageSetMABlkno(right_page, mstate.left_blkno);
-	BTPageSetMergedAway(left_page);
+
+	safemergexid = ReadNextFullTransactionId();
+	BTPageSetMergedAway(left_page, safemergexid);
 
 
 	MarkBufferDirty(left_buf);
