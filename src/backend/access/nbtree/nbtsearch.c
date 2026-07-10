@@ -1773,7 +1773,7 @@ _bt_readfirstpage(IndexScanDesc scan, OffsetNumber offnum, ScanDirection dir)
 		Page		page = BufferGetPage(so->currPos.buf);
 		BTPageOpaque opaque = BTPageGetOpaque(page);
 
-		if (P_MERGED(opaque))
+		if (P_ISMERGED(opaque))
 		{
 			elog(LOG, "BTREE_MERGE_TRACE: _bt_readfirstpage started on BTP_MERGED page, setting skipMergeRecovery");
 			so->skipMergeRecovery = true;
@@ -1958,7 +1958,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 		lastcurrblkno = blkno;
 
 		
-		if (likely(!P_IGNORE(opaque) && !P_MERGED_AWAY(opaque) && !P_MERGED(opaque)))
+		if (likely(!P_IGNORE(opaque) && !P_ISMERGEDAWAY(opaque) && !P_ISMERGED(opaque)))
 		{
 			/* 
 			 * We landed on a normal page. If we were in a merge group, we have now exited it.
@@ -1997,7 +1997,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 			if (scan->parallel_scan != NULL)
 				_bt_parallel_release(scan, blkno, lastcurrblkno);
 		}
-		else if (P_MERGED_AWAY(opaque))
+		else if (P_ISMERGEDAWAY(opaque))
 		{
 			if (ScanDirectionIsForward(dir))
 			{
@@ -2049,7 +2049,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 				}
 			}
 		}
-		else if (P_MERGED(opaque))
+		else if (P_ISMERGED(opaque))
 		{
 			if (ScanDirectionIsForward(dir))
 			{
@@ -2207,7 +2207,7 @@ _bt_find_merge_tail(IndexScanDesc scan, BlockNumber m_blkno, BlockNumber *blkno,
 	l_page = BufferGetPage(l_buf);
 	l_opaque = BTPageGetOpaque(l_page);
 
-	Assert(P_MERGED(l_opaque));
+	Assert(P_ISMERGED(l_opaque));
 
 	/* 
 	 * Step 2: Lock-couple rightward to find the boundary.
@@ -2232,7 +2232,7 @@ _bt_find_merge_tail(IndexScanDesc scan, BlockNumber m_blkno, BlockNumber *blkno,
 		r_opaque = BTPageGetOpaque(r_page);
 
 		/* Check if we found the boundary (the first non-merged page) */
-		if(!P_MERGED(r_opaque))
+		if(!P_ISMERGED(r_opaque))
 		{
 			*blkno = l_blkno;         /* The tail of the merged group */
 			*lastcurrblkno = r_blkno; /* The right anchor for validation */

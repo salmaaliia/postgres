@@ -37,6 +37,7 @@
 #include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
+#include "utils/injection_point.h"
 
 
 /*
@@ -1528,6 +1529,131 @@ backtrack:
 		 * _bt_pagedel() will increment both pages_newly_deleted and
 		 * pages_deleted stats in all cases (barring corruption)
 		 */
+	}
+	else if (P_ISMERGEDAWAY(opaque))
+	{
+		FullTransactionId safemergexid = BTMergedAwayGetSafeXid(page);
+
+		if (GlobalVisCheckRemovableFullXid(heaprel, safemergexid))
+		{
+			BlockNumber tail_blkno;
+			BlockNumber curr_blkno = opaque->btpo_next;
+			Buffer		curr_buf;
+			BTPageOpaque curr_opaque;
+			Buffer		next_buf;
+			BTPageOpaque next_opaque;
+			BlockNumber next_blkno;
+			
+			BlockNumber bwd_blkno;
+			BlockNumber right_anchor;
+			Buffer		bwd_buf;
+			Page		bwd_page;
+			BTPageOpaque bwd_opaque;
+			BlockNumber nextblk;
+			
+			BTPageOpaqueData saved_opaque;
+			IndexTupleData trunctuple;
+
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+			/* Walk Forward to find the tail using lock coupling. */
+			curr_buf = _bt_getbuf(rel, curr_blkno, BT_READ);
+			curr_opaque = BTPageGetOpaque(BufferGetPage(curr_buf));
+
+			while (true)
+			{
+#ifdef USE_INJECTION_POINTS
+				INJECTION_POINT("btvacuum-forward-walk", NULL);
+#endif
+				next_blkno = curr_opaque->btpo_next;
+				
+				if (next_blkno == P_NONE)
+				{
+					tail_blkno = curr_blkno;
+					right_anchor = P_NONE;
+					_bt_relbuf(rel, curr_buf);
+					break;
+				}
+
+				next_buf = _bt_getbuf(rel, next_blkno, BT_READ);
+				next_opaque = BTPageGetOpaque(BufferGetPage(next_buf));
+
+				if (!P_ISMERGED(next_opaque))
+				{
+					tail_blkno = curr_blkno;
+					right_anchor = next_blkno;
+					_bt_relbuf(rel, curr_buf);
+					_bt_relbuf(rel, next_buf);
+					break;
+				}
+
+				_bt_relbuf(rel, curr_buf);
+				curr_blkno = next_blkno;
+				curr_buf = next_buf;
+				curr_opaque = next_opaque;
+			}
+
+			/* Walk Backward to clear M flags (Stop before hitting the MA tombstone!) */
+			bwd_blkno = tail_blkno;
+
+			while (bwd_blkno != blkno)
+			{
+#ifdef USE_INJECTION_POINTS
+				INJECTION_POINT("btvacuum-backward-walk", NULL);
+#endif
+				bwd_buf = _bt_getbuf(rel, bwd_blkno, BT_WRITE);
+				bwd_page = BufferGetPage(bwd_buf);
+				bwd_opaque = BTPageGetOpaque(bwd_page);
+
+				while (bwd_opaque->btpo_next != right_anchor)
+				{
+					nextblk = bwd_opaque->btpo_next;
+					_bt_relbuf(rel, bwd_buf);
+					
+					bwd_buf = _bt_getbuf(rel, nextblk, BT_WRITE);
+					bwd_page = BufferGetPage(bwd_buf);
+					bwd_opaque = BTPageGetOpaque(bwd_page);
+				}
+
+				bwd_opaque->btpo_flags &= ~(BTP_MERGED);
+				MarkBufferDirty(bwd_buf);
+
+				right_anchor = BufferGetBlockNumber(bwd_buf);
+				bwd_blkno = bwd_opaque->btpo_prev;
+				_bt_relbuf(rel, bwd_buf);
+			}
+
+			/* We are back at the tombstone(MA) to make it HD */
+			
+			/* Upgrade our read lock to a write lock while keeping the pin! */
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+			/**
+			 * Stage 2 of _bt_pagedel requires a High Key to exist.
+			 */
+
+			saved_opaque = *opaque;
+
+			PageInit(page, BufferGetPageSize(buf), sizeof(BTPageOpaqueData));
+
+			MemSet(&trunctuple, 0, sizeof(IndexTupleData));
+			trunctuple.t_info = sizeof(IndexTupleData);
+			BTreeTupleSetTopParent(&trunctuple, InvalidBlockNumber);
+
+			if (PageAddItem(page, (IndexTuple) &trunctuple, IndexTupleSize(&trunctuple),
+							P_HIKEY, false, false) == InvalidOffsetNumber)
+				elog(ERROR, "could not add dummy high key to half-dead page");
+
+			
+			opaque = BTPageGetOpaque(page);
+			*opaque = saved_opaque;
+			opaque->btpo_flags &= ~(BTP_MERGED_AWAY | BTP_HAS_FULLXID);
+			opaque->btpo_flags |= BTP_HALF_DEAD;
+			MarkBufferDirty(buf);
+
+
+			attempt_pagedel = true;
+		}
 	}
 	else if (P_ISLEAF(opaque))
 	{

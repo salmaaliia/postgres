@@ -229,25 +229,8 @@ typedef struct BTMetaPageData
 #define P_HAS_GARBAGE(opaque)	(((opaque)->btpo_flags & BTP_HAS_GARBAGE) != 0)
 #define P_INCOMPLETE_SPLIT(opaque)	(((opaque)->btpo_flags & BTP_INCOMPLETE_SPLIT) != 0)
 #define P_HAS_FULLXID(opaque)	(((opaque)->btpo_flags & BTP_HAS_FULLXID) != 0)
-#define P_MERGED(opaque)		(((opaque)->btpo_flags & BTP_MERGED) != 0)
-#define P_MERGED_AWAY(opaque)	(((opaque)->btpo_flags & BTP_MERGED_AWAY) != 0)
-
-static inline void
-BTPageSetMerged(Page page){
-	BTPageOpaque opaque;
-
-	opaque = BTPageGetOpaque(page);
-	opaque->btpo_flags |= BTP_MERGED;
-
-}
-
-static inline void
-BTPageSetMergedAway(Page page){
-	BTPageOpaque opaque;
-
-	opaque = BTPageGetOpaque(page);
-	opaque->btpo_flags |= BTP_MERGED_AWAY;
-}
+#define P_ISMERGED(opaque)		(((opaque)->btpo_flags & BTP_MERGED) != 0)
+#define P_ISMERGEDAWAY(opaque)	(((opaque)->btpo_flags & BTP_MERGED_AWAY) != 0)
 
 /*
  * Accessors for the MERGED_AWAY block number stored on BTP_MERGED pages.
@@ -268,6 +251,54 @@ BTPageSetMergedAway(Page page){
 #define BTMergedPageSetMABlkno(page, blkno) \
 	(((PageHeader)(page))->pd_prune_xid = (TransactionId)(blkno))
 
+typedef struct BTMergedAwayPageData
+{
+	FullTransactionId safemergexid;
+}BTMergedAwayPageData;
+
+static inline void
+BTPageSetMerged(Page page){
+	BTPageOpaque opaque;
+
+	opaque = BTPageGetOpaque(page);
+	opaque->btpo_flags |= BTP_MERGED;
+
+}
+
+static inline void
+BTPageSetMergedAway(Page page, FullTransactionId safemergexid)
+{
+	BTPageOpaque			 opaque;
+	PageHeader				 header;
+	BTMergedAwayPageData   *contents;
+
+	opaque = BTPageGetOpaque(page);
+	header = ((PageHeader) page);
+
+	opaque->btpo_flags |= BTP_MERGED_AWAY | BTP_HAS_FULLXID;
+	header->pd_lower = MAXALIGN(SizeOfPageHeaderData) +
+		sizeof(BTMergedAwayPageData);
+	header->pd_upper = header->pd_special;
+
+	contents = (BTMergedAwayPageData *) PageGetContents(page);
+	contents->safemergexid = safemergexid;
+}
+
+static inline FullTransactionId
+BTMergedAwayGetSafeXid(Page page)
+{
+	BTPageOpaque opaque;
+	BTMergedAwayPageData *contents;
+
+	opaque = BTPageGetOpaque(page);
+	Assert(P_ISMERGEDAWAY(opaque));
+
+	if (!P_HAS_FULLXID(opaque))
+		return FirstNormalFullTransactionId;
+
+	contents = (BTMergedAwayPageData *) PageGetContents(page);
+	return contents->safemergexid;
+}
 
 /*
  * BTDeletedPageData is the page contents of a deleted page
