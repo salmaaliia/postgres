@@ -661,7 +661,7 @@ bt_check_level_from_leftmost(BtreeCheckState *state, BtreeLevel level)
 
 		opaque = BTPageGetOpaque(state->target);
 
-		if (P_IGNORE(opaque))
+		if (P_IGNORE(opaque) || P_ISMERGEDAWAY(opaque))
 		{
 			/*
 			 * Since there cannot be a concurrent VACUUM operation in readonly
@@ -818,7 +818,7 @@ nextpage:
 		 * splits wasn't investigated yet.  Thankfully we only need low key
 		 * for readonly verification and concurrent splits won't happen.
 		 */
-		if (state->readonly && !P_RIGHTMOST(opaque))
+		if (state->readonly && !P_RIGHTMOST(opaque) && !P_ISMERGEDAWAY(opaque))
 		{
 			IndexTuple	itup;
 			ItemId		itemid;
@@ -1740,7 +1740,7 @@ bt_target_page_check(BtreeCheckState *state)
 					/*
 					 * All !readonly checks now performed; just return
 					 */
-					if (P_IGNORE(topaque))
+					if (P_IGNORE(topaque) || P_ISMERGEDAWAY(topaque))
 						return;
 				}
 
@@ -1790,7 +1790,7 @@ bt_target_page_check(BtreeCheckState *state)
 												  rightblock_number);
 					topaque = BTPageGetOpaque(rightpage);
 
-					if (P_IGNORE(topaque))
+					if (P_IGNORE(topaque) || P_ISMERGEDAWAY(topaque))
 					{
 						pfree(rightpage);
 						break;
@@ -1912,7 +1912,7 @@ bt_right_page_check_scankey(BtreeCheckState *state, OffsetNumber *rightfirstoffs
 		rightpage = palloc_btree_page(state, targetnext);
 		opaque = BTPageGetOpaque(rightpage);
 
-		if (!P_IGNORE(opaque) || P_RIGHTMOST(opaque))
+		if ((!P_IGNORE(opaque) && !P_ISMERGEDAWAY(opaque)) || P_RIGHTMOST(opaque))
 			break;
 
 		/*
@@ -2258,7 +2258,8 @@ bt_child_highkey_check(BtreeCheckState *state,
 		 * If we visit page with high key, check that it is equal to the
 		 * target key next to corresponding downlink.
 		 */
-		if (!rightsplit && !P_RIGHTMOST(opaque) && !P_ISHALFDEAD(opaque))
+		if (!rightsplit && !P_RIGHTMOST(opaque) && !P_ISHALFDEAD(opaque) &&
+			!P_ISMERGEDAWAY(opaque))
 		{
 			BTPageOpaque topaque;
 			IndexTuple	highkey;
@@ -2497,6 +2498,16 @@ bt_child_check(BtreeCheckState *state, BTScanInsert targetkey,
 									state->targetblock, childblock,
 									LSN_FORMAT_ARGS(state->targetlsn))));
 
+	/*
+	 * Merged-away pages have their tuple space wiped by BTPageSetMergedAway,
+	 * so there is nothing to iterate over. Skip the item checks entirely.
+	 */
+	if (P_ISMERGEDAWAY(copaque))
+	{
+		pfree(child);
+		return;
+	}
+
 	for (offset = P_FIRSTDATAKEY(copaque);
 		 offset <= maxoffset;
 		 offset = OffsetNumberNext(offset))
@@ -2610,6 +2621,13 @@ bt_downlink_missing_check(BtreeCheckState *state, bool rightsplit,
 									LSN_FORMAT_ARGS(pagelsn))));
 		return;
 	}
+
+	/*
+	 * A merged-away leaf page intentionally lacks a parent downlink,
+	 * as it was unlinked during the custom bt_merge operation.
+	 */
+	if (P_ISMERGEDAWAY(opaque))
+		return;
 
 	/*
 	 * Page under check is probably the "top parent" of a multi-level page
@@ -3435,7 +3453,7 @@ palloc_btree_page(BtreeCheckState *state, BlockNumber blocknum)
 				 errmsg_internal("internal page block %u in index \"%s\" has garbage items",
 								 blocknum, RelationGetRelationName(state->rel))));
 
-	if (P_HAS_FULLXID(opaque) && !P_ISDELETED(opaque))
+	if (P_HAS_FULLXID(opaque) && (!P_ISDELETED(opaque) && !P_ISMERGEDAWAY(opaque)))
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg_internal("full transaction id page flag appears in non-deleted block %u in index \"%s\"",

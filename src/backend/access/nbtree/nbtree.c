@@ -1554,6 +1554,9 @@ backtrack:
 			BTPageOpaqueData saved_opaque;
 			IndexTupleData trunctuple;
 
+			/**
+			 * I am not sure how ulocking and locking affects the vaccum work
+			 */
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
 			/* Walk Forward to find the tail using lock coupling. */
@@ -1562,9 +1565,6 @@ backtrack:
 
 			while (true)
 			{
-#ifdef USE_INJECTION_POINTS
-				INJECTION_POINT("btvacuum-forward-walk", NULL);
-#endif
 				next_blkno = curr_opaque->btpo_next;
 				
 				if (next_blkno == P_NONE)
@@ -1598,9 +1598,6 @@ backtrack:
 
 			while (bwd_blkno != blkno)
 			{
-#ifdef USE_INJECTION_POINTS
-				INJECTION_POINT("btvacuum-backward-walk", NULL);
-#endif
 				bwd_buf = _bt_getbuf(rel, bwd_blkno, BT_WRITE);
 				bwd_page = BufferGetPage(bwd_buf);
 				bwd_opaque = BTPageGetOpaque(bwd_page);
@@ -1616,6 +1613,7 @@ backtrack:
 				}
 
 				bwd_opaque->btpo_flags &= ~(BTP_MERGED);
+				BTMergedPageClearMABlkno(bwd_page);
 				MarkBufferDirty(bwd_buf);
 
 				right_anchor = BufferGetBlockNumber(bwd_buf);
