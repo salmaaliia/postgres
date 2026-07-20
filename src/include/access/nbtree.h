@@ -251,6 +251,16 @@ typedef struct BTMetaPageData
 #define BTMergedPageSetMABlkno(page, blkno) \
 	(((PageHeader)(page))->pd_prune_xid = (TransactionId)(blkno))
 
+/*
+ * Clear the MA block number from a MERGED page when the BTP_MERGED flag is
+ * being cleared (e.g., during vacuum cleanup of the merge group).
+ * Restores pd_prune_xid to its standard value of InvalidTransactionId (0),
+ * since index pages normally never use that field.
+ */
+#define BTMergedPageClearMABlkno(page) \
+	(((PageHeader)(page))->pd_prune_xid = InvalidTransactionId)
+
+
 typedef struct BTMergedAwayPageData
 {
 	FullTransactionId safemergexid;

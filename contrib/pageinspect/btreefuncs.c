@@ -196,8 +196,12 @@ GetBTPageStatistics(BlockNumber blkno, Buffer buffer, BTPageStat *stat)
 	}
 	else if (P_IGNORE(opaque))
 		stat->type = 'e';
-	else if(P_MERGED_AWAY(opaque))
+	else if (P_ISMERGEDAWAY(opaque))
+	{
 		stat->type = 'm';
+		/* Don't interpret BTMergedAwayPageData as index tuples */
+		maxoff = InvalidOffsetNumber;
+	}
 	else if (P_ISLEAF(opaque))
 		stat->type = 'l';
 	else if (P_ISROOT(opaque))
@@ -714,12 +718,15 @@ bt_page_items_internal(PG_FUNCTION_ARGS, enum pageinspect_version ext_version)
 
 		opaque = BTPageGetOpaque(uargs->page);
 
-		if (!P_ISDELETED(opaque))
+		if (!P_ISDELETED(opaque) && !P_ISMERGEDAWAY(opaque))
 			fctx->max_calls = PageGetMaxOffsetNumber(uargs->page);
 		else
 		{
-			/* Don't interpret BTDeletedPageData as index tuples */
-			elog(NOTICE, "page from block " INT64_FORMAT " is deleted", blkno);
+			/* Don't interpret BTDeletedPageData or BTMergedAwayPageData as index tuples */
+			if (P_ISDELETED(opaque))
+				elog(NOTICE, "page from block " INT64_FORMAT " is deleted", blkno);
+			else
+				elog(NOTICE, "page from block " INT64_FORMAT " is merged away", blkno);
 			fctx->max_calls = 0;
 		}
 		uargs->leafpage = P_ISLEAF(opaque);
@@ -829,13 +836,18 @@ bt_page_items_bytea(PG_FUNCTION_ARGS)
 
 		if (P_ISDELETED(opaque))
 			elog(NOTICE, "page is deleted");
+		else if (P_ISMERGEDAWAY(opaque))
+			elog(NOTICE, "page is merged away");
 
-		if (!P_ISDELETED(opaque))
+		if (!P_ISDELETED(opaque) && !P_ISMERGEDAWAY(opaque))
 			fctx->max_calls = PageGetMaxOffsetNumber(uargs->page);
 		else
 		{
-			/* Don't interpret BTDeletedPageData as index tuples */
-			elog(NOTICE, "page from block is deleted");
+			/* Don't interpret BTDeletedPageData or BTMergedAwayPageData as index tuples */
+			if (P_ISDELETED(opaque))
+				elog(NOTICE, "page from block is deleted");
+			else
+				elog(NOTICE, "page from block is merged away");
 			fctx->max_calls = 0;
 		}
 		uargs->leafpage = P_ISLEAF(opaque);
@@ -1116,7 +1128,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 
 			/* Skip deleted, half-dead, and already-merged pages. */
 			if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
-					|| P_MERGED(left_opaque) || P_MERGED_AWAY(left_opaque))
+					|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
 			{
 				uargs->current_blkno = left_opaque->btpo_next;
 				UnlockReleaseBuffer(left_buf);
@@ -1136,7 +1148,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 
 			/* R is unusable; skip directly past it using its btpo_next. */
 			if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
-					|| P_MERGED(right_opaque) || P_MERGED_AWAY(right_opaque))
+					|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
 			{
 				uargs->current_blkno = right_opaque->btpo_next;
 				UnlockReleaseBuffer(right_buf);
@@ -1303,10 +1315,8 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		relrv = makeRangeVarFromNameList(relname_list);
 		rel = relation_openrv(relrv, AccessShareLock);
 
-		if (!IS_INDEX(rel) || !IS_BTREE(rel))
-			ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
-							errmsg("\"%s\" is not a btree index",
-								   RelationGetRelationName(rel))));
+		/* Validate that it is a B-Tree and the block number is within bounds */
+		bt_index_block_validate(rel, left_blkno_arg);
 
 		left_blkno = (BlockNumber) left_blkno_arg;
 
@@ -1323,6 +1333,14 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		if (!P_ISLEAF(left_opaque))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							errmsg("block %u is not a leaf page", left_blkno)));
+
+		if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("block %u is a deleted or half-dead page and cannot be inspected for merge", left_blkno)));
+
+		if (P_ISMERGEDAWAY(left_opaque))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("block %u is a merged-away tombstone and cannot be inspected for merge", left_blkno)));
 
 		right_blkno = left_opaque->btpo_next;
 
@@ -1540,7 +1558,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		max_tids = 2 * BLCKSZ / sizeof(ItemPointerData);
 		tids_buf = (ItemPointerData *) palloc(max_tids * sizeof(ItemPointerData));
 
-		if (P_ISLEAF(opaque))
+		if (P_ISLEAF(opaque) && !P_ISMERGEDAWAY(opaque) && !P_ISDELETED(opaque))
 		{
 			first_off = P_FIRSTDATAKEY(opaque);
 			for (off = first_off; off <= maxoff; off++)
@@ -1588,7 +1606,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 				last_val_hex = index_tuple_data(last_itup);
 			}
 		}
-		else
+		else if (!P_ISMERGEDAWAY(opaque) && !P_ISDELETED(opaque))
 		{
 			for (off = FirstOffsetNumber; off <= maxoff; off++)
 			{
