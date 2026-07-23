@@ -40,6 +40,7 @@
 #include "utils/injection_point.h"
 
 
+
 /*
  * BTPARALLEL_NOT_INITIALIZED indicates that the scan has not started.
  *
@@ -1547,7 +1548,8 @@ backtrack:
 			BlockNumber bwd_blkno;
 			BlockNumber right_anchor;
 			Buffer		bwd_buf;
-			Page		bwd_page;
+			Page		bwd_page,
+						curr_page;
 			BTPageOpaque bwd_opaque;
 			BlockNumber nextblk;
 			
@@ -1555,13 +1557,27 @@ backtrack:
 			IndexTupleData trunctuple;
 
 			/**
-			 * I am not sure how ulocking and locking affects the vaccum work
+			 * We release the MA page lock here because the forward and backward 
+			 * walks acquire write locks on M pages. 
+			 * Holding the MA read lock across multiple buffer lock acquisitions 
+			 * would violate PostgreSQL's lock ordering rules and risk deadlock. 
+			 * The pin on buf is retained throughout, preventing the MA page from changes.
 			 */
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
 			/* Walk Forward to find the tail using lock coupling. */
 			curr_buf = _bt_getbuf(rel, curr_blkno, BT_READ);
-			curr_opaque = BTPageGetOpaque(BufferGetPage(curr_buf));
+			curr_page = BufferGetPage(curr_buf);
+			curr_opaque = BTPageGetOpaque(curr_page);
+
+			/**
+			 * If the last VACUUM run cleared all M page flags and stopped before clearing the MA page flag.
+			 */
+			if (!BTPageIsMergedMember(curr_opaque, curr_page, blkno))
+			{
+				_bt_relbuf(rel, curr_buf);
+				goto finalize_ma;
+			}
 
 			while (true)
 			{
@@ -1578,7 +1594,10 @@ backtrack:
 				next_buf = _bt_getbuf(rel, next_blkno, BT_READ);
 				next_opaque = BTPageGetOpaque(BufferGetPage(next_buf));
 
-				if (!P_ISMERGED(next_opaque))
+				/**
+				 * The end of the merge group was reached.
+				 */
+				if (!BTPageIsMergedMember(next_opaque, BufferGetPage(next_buf), blkno))
 				{
 					tail_blkno = curr_blkno;
 					right_anchor = next_blkno;
@@ -1612,19 +1631,48 @@ backtrack:
 					bwd_opaque = BTPageGetOpaque(bwd_page);
 				}
 
+				/**
+				 * If we stepped in a page from different Merge group, we know something is wrong and skip the cleanup.
+				 * This case is very unlikly to happen because:
+				 * 	- When a page splits, the new page also has the M flag.
+				 * 	- No other VACUUM proccess will run at the same time so no other process will reset any page in between.
+				 */
+				if (!BTPageIsMergedMember(bwd_opaque, bwd_page, blkno))
+				{
+					_bt_relbuf(rel, bwd_buf);
+					ereport(WARNING,
+						(errmsg("merged-away page %u: unexpected page state near block %u, deferring remaining cleanup to a future VACUUM",
+								blkno, bwd_blkno)));
+
+					goto skip_merge_cleanup;
+				}
+
 				bwd_opaque->btpo_flags &= ~(BTP_MERGED);
 				BTMergedPageClearMABlkno(bwd_page);
 				MarkBufferDirty(bwd_buf);
+
+				/* TODO: (WAL) needs a critical section + XLOG record */
 
 				right_anchor = BufferGetBlockNumber(bwd_buf);
 				bwd_blkno = bwd_opaque->btpo_prev;
 				_bt_relbuf(rel, bwd_buf);
 			}
 
+			finalize_ma:
+
 			/* We are back at the tombstone(MA) to make it HD */
 			
 			/* Upgrade our read lock to a write lock while keeping the pin! */
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+			if(!P_ISMERGEDAWAY(opaque) ||
+				!FullTransactionIdEquals(BTMergedAwayGetSafeXid(page), safemergexid)){
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				ereport(WARNING,
+					(errmsg("merged-away page %u changed concurrently, skipping cleanup",
+							blkno)));
+				goto skip_merge_cleanup;
+			}
 
 			/**
 			 * Stage 2 of _bt_pagedel requires a High Key to exist.
@@ -1633,6 +1681,9 @@ backtrack:
 			saved_opaque = *opaque;
 
 			PageInit(page, BufferGetPageSize(buf), sizeof(BTPageOpaqueData));
+			/**
+			 * TODO(WAL): move PageInit after all fallible work once
+			 * * critical-section handling is added. */
 
 			MemSet(&trunctuple, 0, sizeof(IndexTupleData));
 			trunctuple.t_info = sizeof(IndexTupleData);
@@ -1651,6 +1702,8 @@ backtrack:
 
 
 			attempt_pagedel = true;
+
+			skip_merge_cleanup:;
 		}
 	}
 	else if (P_ISLEAF(opaque))
