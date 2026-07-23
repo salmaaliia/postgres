@@ -285,6 +285,7 @@ BTPageSetMergedAway(Page page, FullTransactionId safemergexid)
 	opaque = BTPageGetOpaque(page);
 	header = ((PageHeader) page);
 
+	BTMergedPageClearMABlkno(page);
 	opaque->btpo_flags |= BTP_MERGED_AWAY | BTP_HAS_FULLXID;
 	header->pd_lower = MAXALIGN(SizeOfPageHeaderData) +
 		sizeof(BTMergedAwayPageData);
@@ -308,6 +309,22 @@ BTMergedAwayGetSafeXid(Page page)
 
 	contents = (BTMergedAwayPageData *) PageGetContents(page);
 	return contents->safemergexid;
+}
+
+/*
+ * BTPageIsMergedMember -- true when a page is a valid member of the merge
+ * group whose tombstone (MA page) is at ma_blkno.
+ 
+ * Used during VACUUM cleanup to validate each M page before clearing its
+ * flags, preventing accidental absorption of pages from an adjacent group.
+ */
+static inline bool
+BTPageIsMergedMember(BTPageOpaque opq, Page pg, BlockNumber ma_blkno)
+{
+	return P_ISMERGED(opq) &&
+		   P_ISLEAF(opq) &&
+		   !P_ISMERGEDAWAY(opq) &&
+		   BTMergedPageGetMABlkno(pg) == ma_blkno;
 }
 
 /*
