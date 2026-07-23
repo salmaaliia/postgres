@@ -254,7 +254,8 @@ static bool
 _bt_mergepage(BTMergeState mstate)
 {
 	Relation rel = mstate.rel;
-	BlockNumber parent_blkno;
+	BlockNumber parent_blkno,
+				child;
 	Buffer		left_buf,
 				right_buf,
 				parent_buf;
@@ -262,23 +263,24 @@ _bt_mergepage(BTMergeState mstate)
 				right_page,
 				parent_page;
 	BTPageOpaque left_opaque,
-				right_opaque;
+				right_opaque,
+				parent_opaque;
 	BTStack		stack;
 	ItemId		itemid;
 	IndexTuple	itup,
 				left_itup;
-	BlockNumber child;
-	OffsetNumber next_off;
 	IndexTuple	r_hikey = NULL;
 	Size		r_hikey_size = 0;
-	OffsetNumber r_start;
-	OffsetNumber r_maxoff;
+	OffsetNumber r_start,
+				r_maxoff,
+				maxoff,
+				next_off,
+				l_start,
+				l_maxoff;
 	int			n_right;
 	IndexTuple *r_tuples;
 	Size	   *r_sizes;
 	BTPageOpaqueData saved_opaque;
-	OffsetNumber l_start;
-	OffsetNumber l_maxoff;
 	ItemId		hikey_id;
 	Size		sz;
 	FullTransactionId safemergexid;
@@ -344,10 +346,40 @@ _bt_mergepage(BTMergeState mstate)
 	parent_buf = ReadBuffer(rel, parent_blkno);
 	LockBuffer(parent_buf, BT_WRITE);
 	parent_page = BufferGetPage(parent_buf);
+	parent_opaque = BTPageGetOpaque(parent_page);
+
+	if(P_ISDELETED(parent_opaque) || P_ISHALFDEAD(parent_opaque) ||
+		parent_opaque->btpo_level != left_opaque->btpo_level + 1)
+	{
+		UnlockReleaseBuffer(parent_buf);
+		UnlockReleaseBuffer(right_buf);
+		UnlockReleaseBuffer(left_buf);
+		return false;
+	}
+
+	maxoff = PageGetMaxOffsetNumber(parent_page);
+	next_off = OffsetNumberNext(stack->bts_offset);
+
+	if(stack->bts_offset < P_FIRSTDATAKEY(parent_opaque) ||
+		next_off > maxoff)
+	{
+		UnlockReleaseBuffer(parent_buf);
+		UnlockReleaseBuffer(right_buf);
+		UnlockReleaseBuffer(left_buf);
+		return false;
+	}
 
 	itemid = PageGetItemId(parent_page, stack->bts_offset);
+	if (!ItemIdIsNormal(itemid))
+	{
+		UnlockReleaseBuffer(parent_buf);
+		UnlockReleaseBuffer(right_buf);
+		UnlockReleaseBuffer(left_buf);
+		return false;
+	}
+
 	itup = (IndexTuple) PageGetItem(parent_page, itemid);
-	child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+	child = BTreeTupleGetDownLink(itup);
 
 	if (child != mstate.left_blkno)
 	{
@@ -359,10 +391,17 @@ _bt_mergepage(BTMergeState mstate)
 
 	left_itup = itup;
 
-	next_off = OffsetNumberNext(stack->bts_offset);
 	itemid = PageGetItemId(parent_page, next_off);
+	if (!ItemIdIsNormal(itemid))
+	{
+		UnlockReleaseBuffer(parent_buf);
+		UnlockReleaseBuffer(right_buf);
+		UnlockReleaseBuffer(left_buf);
+		return false;
+	}
+
 	itup = (IndexTuple) PageGetItem(parent_page, itemid);
-	child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+	child = BTreeTupleGetDownLink(itup);
 
 	if (child != mstate.right_blkno)
 	{
@@ -404,7 +443,7 @@ _bt_mergepage(BTMergeState mstate)
 
 	/* Reinitialize R, preserving its opaque header. */
 	saved_opaque = *right_opaque;
-	PageInit(right_page, BLCKSZ, sizeof(BTPageOpaqueData));
+	PageInit(right_page, BufferGetPageSize(right_buf), sizeof(BTPageOpaqueData));
 	*BTPageGetOpaque(right_page) = saved_opaque;
 
 	if (r_hikey != NULL)

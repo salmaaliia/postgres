@@ -285,7 +285,6 @@ BTPageSetMergedAway(Page page, FullTransactionId safemergexid)
 	opaque = BTPageGetOpaque(page);
 	header = ((PageHeader) page);
 
-	BTMergedPageClearMABlkno(page);
 	opaque->btpo_flags |= BTP_MERGED_AWAY | BTP_HAS_FULLXID;
 	header->pd_lower = MAXALIGN(SizeOfPageHeaderData) +
 		sizeof(BTMergedAwayPageData);
