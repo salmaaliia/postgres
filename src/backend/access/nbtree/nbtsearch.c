@@ -1775,7 +1775,6 @@ _bt_readfirstpage(IndexScanDesc scan, OffsetNumber offnum, ScanDirection dir)
 
 		if (P_ISMERGED(opaque))
 		{
-			elog(LOG, "BTREE_MERGE_TRACE: _bt_readfirstpage started on BTP_MERGED page, setting skipMergeRecovery");
 			so->skipMergeRecovery = true;
 		}
 	}
@@ -1966,7 +1965,6 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 			 */
 			if (so->needMergeRecovery || so->skipMergeRecovery)
 			{
-				elog(LOG, "BTREE_MERGE_TRACE: path 8 (Hit normal page, clearing recovery flags)");
 				so->needMergeRecovery = false;
 				so->skipMergeRecovery = false;
 			}
@@ -2002,7 +2000,6 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 			if (ScanDirectionIsForward(dir))
 			{
 				/* Save state indicating we passed a merged away page and proceed to the next page */
-				elog(LOG, "BTREE_MERGE_TRACE: path 1 (FWD SCAN: Hit Tombstone, setting skipMergeRecovery)");
 				so->skipMergeRecovery = true;
 				so->mergedAwayBlkno = blkno;
 				blkno = opaque->btpo_next;
@@ -2023,7 +2020,6 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 					 * or we just finished walking backward through the recovery group (needMergeRecovery).
 					 * In either case, we safely skip this tombstone and step left.
 					 */
-					elog(LOG, "BTREE_MERGE_TRACE: path 2 (BWD SCAN: Safely skipping Tombstone)");
 					blkno = opaque->btpo_prev;
 
 					/* Clear the states since we are exiting the merge group */
@@ -2037,7 +2033,6 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 					 * This means the merge happened right after we read the left page.
 					 * We must enter recovery mode to find the merged tuples.
 					 */
-					elog(LOG, "BTREE_MERGE_TRACE: path 3 (BWD SCAN: Hit Tombstone, entering recovery mode)");
 					so->needMergeRecovery = true;
 					
 					/* 1- Save the TIDs we already read to filter them out later */
@@ -2062,7 +2057,6 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 				 */
 				if (so->skipMergeRecovery)
 				{
-					elog(LOG, "BTREE_MERGE_TRACE: path 4 (FWD SCAN: Hit Merged Page, skipping recovery)");
 					if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque), seized))
 						break;
 					blkno = so->currPos.nextPage;
@@ -2073,7 +2067,6 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 					 * FWD SCAN: Recovery Mode
 					 * We read the left page before it was merged. 
 					 */
-					elog(LOG, "BTREE_MERGE_TRACE: path 5 (FWD SCAN: Hit Merged Page in recovery mode)");
 					if (!so->needMergeRecovery)
 					{
 						/* 
@@ -2142,7 +2135,6 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 
 		if(needMergeRecoverWalk)
 		{
-			elog(LOG, "BTREE_MERGE_TRACE: path 9 (Calling _bt_find_merge_tail)");
 			_bt_find_merge_tail(scan, m_blkno, &blkno, &lastcurrblkno);
 			/* After this call the loop will continue to read blkno page 
 			** so we now have to how these MERGED pages are going to be read
