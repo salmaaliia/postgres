@@ -3133,32 +3133,33 @@ _bt_pendingfsm_add(BTVacState *vstate,
 
 bool
 _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
-					  BlockNumber right_blkno, BTScanInsert scankey, BTStack *stack_out)
+					   BlockNumber right_blkno, BTScanInsert scankey, BTStack *stack_out)
 {
 	BTStack		stack;
 	Buffer		found_buf = InvalidBuffer;
 	BlockNumber parent_blkno = InvalidBlockNumber;
 	Buffer		parent_buf;
 	Page		parent_page;
-	OffsetNumber 	maxoff,
-					left_off;
+	OffsetNumber maxoff,
+				left_off;
 	bool		found_left = false;
 	IndexTuple	itup;
 	BlockNumber child;
 
 
 	/* Descend the tree to find left's parent. Caller built scankey. */
-	stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ);
+	stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ, true);
 
-	if(BufferIsValid(found_buf))
+	if (BufferIsValid(found_buf))
 		UnlockReleaseBuffer(found_buf);
 
-	if(stack == NULL)
+	if (stack == NULL)
 		return false;
 
 	parent_blkno = stack->bts_blkno;
 
-	if(parent_blkno == InvalidBlockNumber){
+	if (parent_blkno == InvalidBlockNumber)
+	{
 		_bt_freestack(stack);
 		return false;
 	}
@@ -3182,7 +3183,8 @@ _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 	/**
 	 * check if off + 1 in the parent is the right sibling
 	 */
-	if(found_left){
+	if (found_left)
+	{
 		OffsetNumber next_off = OffsetNumberNext(left_off);
 
 		if (next_off <= maxoff)
@@ -3191,12 +3193,13 @@ _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 
 			child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
 
-			if(child == right_blkno){
+			if (child == right_blkno)
+			{
 				UnlockReleaseBuffer(parent_buf);
 				if (stack_out != NULL)
-    				*stack_out = stack;
+					*stack_out = stack;
 				else
-    				_bt_freestack(stack);
+					_bt_freestack(stack);
 				return true;
 			}
 		}

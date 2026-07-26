@@ -84,7 +84,8 @@ typedef BTPageOpaqueData *BTPageOpaque;
 #define BTP_INCOMPLETE_SPLIT (1 << 7)	/* right sibling's downlink is missing */
 #define BTP_HAS_FULLXID	(1 << 8)	/* contains BTDeletedPageData */
 #define BTP_MERGED		(1 << 9)	/* This node contain its lift sibling data */
-#define BTP_MERGED_AWAY	(1 << 10)	/* This node was merged into its right sibling */
+#define BTP_MERGED_AWAY	(1 << 10)	/* This node was merged into its right
+									 * sibling */
 
 /*
  * The max allowed value of a cycle ID is a bit less than 64K.  This is
@@ -264,10 +265,11 @@ typedef struct BTMetaPageData
 typedef struct BTMergedAwayPageData
 {
 	FullTransactionId safemergexid;
-}BTMergedAwayPageData;
+}			BTMergedAwayPageData;
 
 static inline void
-BTPageSetMerged(Page page){
+BTPageSetMerged(Page page)
+{
 	BTPageOpaque opaque;
 
 	opaque = BTPageGetOpaque(page);
@@ -278,9 +280,9 @@ BTPageSetMerged(Page page){
 static inline void
 BTPageSetMergedAway(Page page, FullTransactionId safemergexid)
 {
-	BTPageOpaque			 opaque;
-	PageHeader				 header;
-	BTMergedAwayPageData   *contents;
+	BTPageOpaque opaque;
+	PageHeader	header;
+	BTMergedAwayPageData *contents;
 
 	opaque = BTPageGetOpaque(page);
 	header = ((PageHeader) page);
@@ -313,7 +315,7 @@ BTMergedAwayGetSafeXid(Page page)
 /*
  * BTPageIsMergedMember -- true when a page is a valid member of the merge
  * group whose tombstone (MA page) is at ma_blkno.
- 
+ *
  * Used during VACUUM cleanup to validate each M page before clearing its
  * flags, preventing accidental absorption of pages from an adjacent group.
  */
@@ -321,9 +323,9 @@ static inline bool
 BTPageIsMergedMember(BTPageOpaque opq, Page pg, BlockNumber ma_blkno)
 {
 	return P_ISMERGED(opq) &&
-		   P_ISLEAF(opq) &&
-		   !P_ISMERGEDAWAY(opq) &&
-		   BTMergedPageGetMABlkno(pg) == ma_blkno;
+		P_ISLEAF(opq) &&
+		!P_ISMERGEDAWAY(opq) &&
+		BTMergedPageGetMABlkno(pg) == ma_blkno;
 }
 
 /*
@@ -1192,12 +1194,12 @@ typedef struct BTScanOpaqueData
 	BTScanPosData markPos;		/* marked position, if any */
 
 	/* Merge information */
-	bool skipMergeRecovery; 
-	bool needMergeRecovery;
+	bool		skipMergeRecovery;
+	bool		needMergeRecovery;
 
 	ItemPointerData savedMergeTids[MaxTIDsPerBTreePage];
-	int             nSavedMergeTids;  /* number of TIDs in the array */
-	BlockNumber     mergedAwayBlkno;  /* blkno of L (BTP_MERGED_AWAY page) */
+	int			nSavedMergeTids;	/* number of TIDs in the array */
+	BlockNumber mergedAwayBlkno;	/* blkno of L (BTP_MERGED_AWAY page) */
 
 } BTScanOpaqueData;
 
@@ -1326,6 +1328,7 @@ extern void _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf,
 							 BTStack stack);
 extern Buffer _bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack,
 							  BlockNumber child);
+extern void _bt_freestack(BTStack stack);
 
 /*
  * prototypes for functions in nbtsplitloc.c
@@ -1370,7 +1373,7 @@ extern void _bt_pendingfsm_init(Relation rel, BTVacState *vstate,
 								bool cleanuponly);
 extern void _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate);
 extern bool _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
-                                    BlockNumber right_blkno, BTScanInsert scankey, BTStack *stack_out);
+								   BlockNumber right_blkno, BTScanInsert scankey, BTStack *stack_out);
 
 /*
  * prototypes for functions in nbtpreprocesskeys.c

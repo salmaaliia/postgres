@@ -23,6 +23,7 @@
 #include "storage/lmgr.h"
 #include "utils/injection_point.h"
 #include "storage/predicate.h"
+#include "miscadmin.h"
 
 typedef struct BTMergeState
 {
@@ -33,7 +34,7 @@ typedef struct BTMergeState
 	BlockNumber left_blkno;
 	BlockNumber right_blkno;
 	BTStack		stack;
-} BTMergeState;
+}			BTMergeState;
 
 
 static int32 _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_limit);
@@ -159,7 +160,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		}
 
 		if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
-				|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
+			|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
 		{
 			current_blkno = left_opaque->btpo_next;
 			UnlockReleaseBuffer(left_buf);
@@ -176,7 +177,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		right_opaque = BTPageGetOpaque(right_page);
 
 		if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
-				|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
+			|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
 		{
 			current_blkno = right_opaque->btpo_next;
 			UnlockReleaseBuffer(right_buf);
@@ -253,7 +254,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 static bool
 _bt_mergepage(BTMergeState mstate)
 {
-	Relation rel = mstate.rel;
+	Relation	rel = mstate.rel;
 	BlockNumber parent_blkno,
 				child;
 	Buffer		left_buf,
@@ -304,7 +305,7 @@ _bt_mergepage(BTMergeState mstate)
 
 	/* Re-verify left under exclusive lock. */
 	if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
-			|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
+		|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
 	{
 		UnlockReleaseBuffer(right_buf);
 		UnlockReleaseBuffer(left_buf);
@@ -321,7 +322,7 @@ _bt_mergepage(BTMergeState mstate)
 
 	/* Re-verify right under exclusive lock. */
 	if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
-			|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
+		|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
 	{
 		UnlockReleaseBuffer(right_buf);
 		UnlockReleaseBuffer(left_buf);
@@ -348,7 +349,7 @@ _bt_mergepage(BTMergeState mstate)
 	parent_page = BufferGetPage(parent_buf);
 	parent_opaque = BTPageGetOpaque(parent_page);
 
-	if(P_ISDELETED(parent_opaque) || P_ISHALFDEAD(parent_opaque) ||
+	if (P_ISDELETED(parent_opaque) || P_ISHALFDEAD(parent_opaque) ||
 		parent_opaque->btpo_level != left_opaque->btpo_level + 1)
 	{
 		UnlockReleaseBuffer(parent_buf);
@@ -360,7 +361,7 @@ _bt_mergepage(BTMergeState mstate)
 	maxoff = PageGetMaxOffsetNumber(parent_page);
 	next_off = OffsetNumberNext(stack->bts_offset);
 
-	if(stack->bts_offset < P_FIRSTDATAKEY(parent_opaque) ||
+	if (stack->bts_offset < P_FIRSTDATAKEY(parent_opaque) ||
 		next_off > maxoff)
 	{
 		UnlockReleaseBuffer(parent_buf);
@@ -488,8 +489,9 @@ _bt_mergepage(BTMergeState mstate)
 	 */
 	BTreeTupleSetDownLink(left_itup, mstate.right_blkno);
 	PageIndexTupleDelete(parent_page, next_off);
-	
+
 	BTPageSetMerged(right_page);
+
 	/*
 	 * Record the block number of the MERGED_AWAY (tombstone) page on every
 	 * MERGED page.  The backward scan uses this to verify it has found the

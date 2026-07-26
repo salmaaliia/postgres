@@ -240,6 +240,7 @@ static inline ItemPointer BTreeTupleGetHeapTIDCareful(BtreeCheckState *state,
 static inline ItemPointer BTreeTupleGetPointsToTID(IndexTuple itup);
 static void bt_check_ma_page(BtreeCheckState *state);
 static void bt_check_m_page(BtreeCheckState *state);
+
 /*
  * bt_index_check(index regclass, heapallindexed boolean, checkunique boolean)
  *
@@ -683,9 +684,9 @@ bt_check_level_from_leftmost(BtreeCheckState *state, BtreeLevel level)
 						 errdetail_internal("Block=%u left block=%u left link from block=%u.",
 											current, leftcurrent, opaque->btpo_prev)));
 
-			if(P_ISMERGEDAWAY(opaque))
+			if (P_ISMERGEDAWAY(opaque))
 				bt_check_ma_page(state);
-				
+
 			if (P_RIGHTMOST(opaque))
 				ereport(ERROR,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -1285,7 +1286,7 @@ bt_target_page_check(BtreeCheckState *state)
 		}
 	}
 
-	if(P_ISMERGED(topaque))
+	if (P_ISMERGED(topaque))
 		bt_check_m_page(state);
 
 	/*
@@ -2508,17 +2509,17 @@ bt_child_check(BtreeCheckState *state, BTScanInsert targetkey,
 	/*
 	 * A merged-away (MA) page is a tombstone that should have had its parent
 	 * downlink redirected to the merged destination page (R) during the merge
-	 * operation. In readonly mode, no concurrent merge can be in progress,
-	 * so finding a downlink to an MA page indicates corruption.
+	 * operation. In readonly mode, no concurrent merge can be in progress, so
+	 * finding a downlink to an MA page indicates corruption.
 	 */
 	if (P_ISMERGEDAWAY(copaque))
-	    ereport(ERROR,
-	            (errcode(ERRCODE_INDEX_CORRUPTED),
-	             errmsg("downlink to merged-away page found in index \"%s\"",
-	                    RelationGetRelationName(state->rel)),
-	             errdetail_internal("Parent block=%u child block=%u parent page lsn=%X/%08X.",
-	                                state->targetblock, childblock,
-	                                LSN_FORMAT_ARGS(state->targetlsn))));
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("downlink to merged-away page found in index \"%s\"",
+						RelationGetRelationName(state->rel)),
+				 errdetail_internal("Parent block=%u child block=%u parent page lsn=%X/%08X.",
+									state->targetblock, childblock,
+									LSN_FORMAT_ARGS(state->targetlsn))));
 
 
 	for (offset = P_FIRSTDATAKEY(copaque);
@@ -2636,8 +2637,8 @@ bt_downlink_missing_check(BtreeCheckState *state, bool rightsplit,
 	}
 
 	/*
-	 * A merged-away leaf page intentionally lacks a parent downlink,
-	 * as it was unlinked during the custom bt_merge operation.
+	 * A merged-away leaf page intentionally lacks a parent downlink, as it
+	 * was unlinked during the custom bt_merge operation.
 	 */
 	if (P_ISMERGEDAWAY(opaque))
 		return;
@@ -3665,7 +3666,7 @@ bt_check_ma_page(BtreeCheckState *state)
 						block, RelationGetRelationName(state->rel))));
 }
 
-static void 
+static void
 bt_check_m_page(BtreeCheckState *state)
 {
 	Page		page = state->target;
@@ -3691,8 +3692,8 @@ bt_check_m_page(BtreeCheckState *state)
 	ma_blkno = BTMergedPageGetMABlkno(page);
 
 	if (!BlockNumberIsValid(ma_blkno) ||
-			ma_blkno == BTREE_METAPAGE  ||
-			ma_blkno == block)
+		ma_blkno == BTREE_METAPAGE ||
+		ma_blkno == block)
 		ereport(ERROR,
 				(errcode(ERRCODE_INDEX_CORRUPTED),
 				 errmsg("merged page %u has invalid MA block number %u in index \"%s\"",
@@ -3713,10 +3714,10 @@ bt_check_m_page(BtreeCheckState *state)
 	pfree(ma_page);
 
 	/*
-	 * Verify adjacent merge group consistency:
-	 * In readonly mode (where no concurrent VACUUM/merge can occur), if the right
-	 * sibling is also an M page, it must belong to the same merge group (i.e. name
-	 * the exact same MA block number).
+	 * Verify adjacent merge group consistency: In readonly mode (where no
+	 * concurrent VACUUM/merge can occur), if the right sibling is also an M
+	 * page, it must belong to the same merge group (i.e. name the exact same
+	 * MA block number).
 	 */
 	if (state->readonly && opaque->btpo_next != P_NONE)
 	{
@@ -3727,6 +3728,7 @@ bt_check_m_page(BtreeCheckState *state)
 			BTMergedPageGetMABlkno(next_page) != ma_blkno)
 		{
 			BlockNumber next_ma = BTMergedPageGetMABlkno(next_page);
+
 			pfree(next_page);
 			ereport(ERROR,
 					(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -3737,4 +3739,3 @@ bt_check_m_page(BtreeCheckState *state)
 		pfree(next_page);
 	}
 }
-
