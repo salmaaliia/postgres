@@ -238,7 +238,8 @@ static ItemId PageGetItemIdCareful(BtreeCheckState *state, BlockNumber block,
 static inline ItemPointer BTreeTupleGetHeapTIDCareful(BtreeCheckState *state,
 													  IndexTuple itup, bool nonpivot);
 static inline ItemPointer BTreeTupleGetPointsToTID(IndexTuple itup);
-
+static void bt_check_ma_page(BtreeCheckState *state);
+static void bt_check_m_page(BtreeCheckState *state);
 /*
  * bt_index_check(index regclass, heapallindexed boolean, checkunique boolean)
  *
@@ -682,6 +683,9 @@ bt_check_level_from_leftmost(BtreeCheckState *state, BtreeLevel level)
 						 errdetail_internal("Block=%u left block=%u left link from block=%u.",
 											current, leftcurrent, opaque->btpo_prev)));
 
+			if(P_ISMERGEDAWAY(opaque))
+				bt_check_ma_page(state);
+				
 			if (P_RIGHTMOST(opaque))
 				ereport(ERROR,
 						(errcode(ERRCODE_INDEX_CORRUPTED),
@@ -1280,6 +1284,9 @@ bt_target_page_check(BtreeCheckState *state)
 										LSN_FORMAT_ARGS(state->targetlsn))));
 		}
 	}
+
+	if(P_ISMERGED(topaque))
+		bt_check_m_page(state);
 
 	/*
 	 * Loop over page items, starting from first non-highkey item, not high
@@ -2499,14 +2506,20 @@ bt_child_check(BtreeCheckState *state, BTScanInsert targetkey,
 									LSN_FORMAT_ARGS(state->targetlsn))));
 
 	/*
-	 * Merged-away pages have their tuple space wiped by BTPageSetMergedAway,
-	 * so there is nothing to iterate over. Skip the item checks entirely.
+	 * A merged-away (MA) page is a tombstone that should have had its parent
+	 * downlink redirected to the merged destination page (R) during the merge
+	 * operation. In readonly mode, no concurrent merge can be in progress,
+	 * so finding a downlink to an MA page indicates corruption.
 	 */
 	if (P_ISMERGEDAWAY(copaque))
-	{
-		pfree(child);
-		return;
-	}
+	    ereport(ERROR,
+	            (errcode(ERRCODE_INDEX_CORRUPTED),
+	             errmsg("downlink to merged-away page found in index \"%s\"",
+	                    RelationGetRelationName(state->rel)),
+	             errdetail_internal("Parent block=%u child block=%u parent page lsn=%X/%08X.",
+	                                state->targetblock, childblock,
+	                                LSN_FORMAT_ARGS(state->targetlsn))));
+
 
 	for (offset = P_FIRSTDATAKEY(copaque);
 		 offset <= maxoffset;
@@ -3609,3 +3622,119 @@ BTreeTupleGetPointsToTID(IndexTuple itup)
 	/* Pivot tuple returns TID with downlink block (heapkeyspace variant) */
 	return &itup->t_tid;
 }
+
+
+static void
+bt_check_ma_page(BtreeCheckState *state)
+{
+	Page		page = state->target;
+	BlockNumber block = state->targetblock;
+	BTPageOpaque opaque = BTPageGetOpaque(page);
+
+
+	if (!P_ISLEAF(opaque))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("merged-away block %u is not a leaf page in index \"%s\"",
+						block, RelationGetRelationName(state->rel))));
+
+	if (P_ISROOT(opaque))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("merged-away block %u cannot be root page in index \"%s\"",
+						block, RelationGetRelationName(state->rel))));
+
+
+	if (P_ISMERGED(opaque) || P_ISHALFDEAD(opaque) || P_ISDELETED(opaque))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("merged-away block %u has conflicting page flags in index \"%s\"",
+						block, RelationGetRelationName(state->rel))));
+
+	if (opaque->btpo_next == P_NONE)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("merged-away block %u lacks right sibling in index \"%s\"",
+						block, RelationGetRelationName(state->rel))));
+
+	if (!P_HAS_FULLXID(opaque) ||
+		!FullTransactionIdIsValid(BTMergedAwayGetSafeXid(page)))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("merged-away block %u has invalid safemergexid in index \"%s\"",
+						block, RelationGetRelationName(state->rel))));
+}
+
+static void 
+bt_check_m_page(BtreeCheckState *state)
+{
+	Page		page = state->target;
+	BlockNumber block = state->targetblock;
+	BTPageOpaque opaque = BTPageGetOpaque(page);
+
+	BlockNumber ma_blkno;
+	Page		ma_page;
+	BTPageOpaque ma_opaque;
+
+	if (!P_ISLEAF(opaque))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("merged page %u is not a leaf page in index \"%s\"",
+						block, RelationGetRelationName(state->rel))));
+
+	if (P_ISMERGEDAWAY(opaque))
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("merged page %u cannot also be a merged-away tombstone in index \"%s\"",
+						block, RelationGetRelationName(state->rel))));
+
+	ma_blkno = BTMergedPageGetMABlkno(page);
+
+	if (!BlockNumberIsValid(ma_blkno) ||
+			ma_blkno == BTREE_METAPAGE  ||
+			ma_blkno == block)
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("merged page %u has invalid MA block number %u in index \"%s\"",
+						block, ma_blkno, RelationGetRelationName(state->rel))));
+
+	ma_page = palloc_btree_page(state, ma_blkno);
+	ma_opaque = BTPageGetOpaque(ma_page);
+
+	if (state->readonly && !P_ISMERGEDAWAY(ma_opaque))
+	{
+		pfree(ma_page);
+		ereport(ERROR,
+				(errcode(ERRCODE_INDEX_CORRUPTED),
+				 errmsg("merged page %u points to MA block %u which is not a merged-away tombstone in index \"%s\"",
+						block, ma_blkno, RelationGetRelationName(state->rel))));
+	}
+
+	pfree(ma_page);
+
+	/*
+	 * Verify adjacent merge group consistency:
+	 * In readonly mode (where no concurrent VACUUM/merge can occur), if the right
+	 * sibling is also an M page, it must belong to the same merge group (i.e. name
+	 * the exact same MA block number).
+	 */
+	if (state->readonly && opaque->btpo_next != P_NONE)
+	{
+		Page		next_page = palloc_btree_page(state, opaque->btpo_next);
+		BTPageOpaque next_opaque = BTPageGetOpaque(next_page);
+
+		if (P_ISMERGED(next_opaque) &&
+			BTMergedPageGetMABlkno(next_page) != ma_blkno)
+		{
+			BlockNumber next_ma = BTMergedPageGetMABlkno(next_page);
+			pfree(next_page);
+			ereport(ERROR,
+					(errcode(ERRCODE_INDEX_CORRUPTED),
+					 errmsg("adjacent merged pages %u and %u have inconsistent MA block numbers (%u vs %u) in index \"%s\"",
+							block, opaque->btpo_next, ma_blkno, next_ma,
+							RelationGetRelationName(state->rel))));
+		}
+		pfree(next_page);
+	}
+}
+
