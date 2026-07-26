@@ -114,13 +114,13 @@ typedef struct ua_page_items
  */
 typedef struct ua_merge_candidates
 {
-	Oid			relid;			
-	BlockNumber current_blkno;	
+	Oid			relid;
+	BlockNumber current_blkno;
 	TupleDesc	tupd;
-	float8		merge_candidate_max_pct;		
-	float8		merge_destination_max_pct;		
-	int			num_pages;		
-	int			returned;		
+	float8		merge_candidate_max_pct;
+	float8		merge_destination_max_pct;
+	int			num_pages;
+	int			returned;
 
 }			ua_merge_candidates;
 
@@ -722,7 +722,10 @@ bt_page_items_internal(PG_FUNCTION_ARGS, enum pageinspect_version ext_version)
 			fctx->max_calls = PageGetMaxOffsetNumber(uargs->page);
 		else
 		{
-			/* Don't interpret BTDeletedPageData or BTMergedAwayPageData as index tuples */
+			/*
+			 * Don't interpret BTDeletedPageData or BTMergedAwayPageData as
+			 * index tuples
+			 */
 			if (P_ISDELETED(opaque))
 				elog(NOTICE, "page from block " INT64_FORMAT " is deleted", blkno);
 			else
@@ -843,7 +846,10 @@ bt_page_items_bytea(PG_FUNCTION_ARGS)
 			fctx->max_calls = PageGetMaxOffsetNumber(uargs->page);
 		else
 		{
-			/* Don't interpret BTDeletedPageData or BTMergedAwayPageData as index tuples */
+			/*
+			 * Don't interpret BTDeletedPageData or BTMergedAwayPageData as
+			 * index tuples
+			 */
 			if (P_ISDELETED(opaque))
 				elog(NOTICE, "page from block is deleted");
 			else
@@ -1060,10 +1066,11 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		 */
 		{
 			Buffer		endpoint_buf = _bt_get_endpoint(rel, 0, false);
-			Page temp_page = BufferGetPage(endpoint_buf);
-		    BTPageOpaque temp_opaque = BTPageGetOpaque(temp_page);
+			Page		temp_page = BufferGetPage(endpoint_buf);
+			BTPageOpaque temp_opaque = BTPageGetOpaque(temp_page);
+
 			uargs->current_blkno = temp_opaque->btpo_next;
-			// elog(WARNING, "Hello from bt_find_merge_candidates");
+			/* elog(WARNING, "Hello from bt_find_merge_candidates"); */
 			UnlockReleaseBuffer(endpoint_buf);
 		}
 
@@ -1128,7 +1135,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 
 			/* Skip deleted, half-dead, and already-merged pages. */
 			if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
-					|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
+				|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
 			{
 				uargs->current_blkno = left_opaque->btpo_next;
 				UnlockReleaseBuffer(left_buf);
@@ -1148,7 +1155,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 
 			/* R is unusable; skip directly past it using its btpo_next. */
 			if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
-					|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
+				|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
 			{
 				uargs->current_blkno = right_opaque->btpo_next;
 				UnlockReleaseBuffer(right_buf);
@@ -1165,7 +1172,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				if (first_data_off <= PageGetMaxOffsetNumber(left_page))
 				{
 					IndexTuple	first_itup = (IndexTuple) PageGetItem(left_page,
-																	   PageGetItemId(left_page, first_data_off));
+																	  PageGetItemId(left_page, first_data_off));
 
 					scankey = _bt_mkscankey(rel, first_itup);
 				}
@@ -1182,7 +1189,8 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 
 			/*
 			 * Size check: both pages must individually be below the threshold
-			 * AND their combined content must fit within the target fillfactor.
+			 * AND their combined content must fit within the target
+			 * fillfactor.
 			 */
 			if ((float) left_used / BLCKSZ <= uargs->merge_candidate_max_pct &&
 				(float) right_used / BLCKSZ <= uargs->merge_candidate_max_pct &&
@@ -1193,8 +1201,8 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				 * parent with adjacent downlinks.
 				 */
 				if (scankey != NULL &&
-					
-				_bt_pages_share_parent(rel, left_blkno, right_blkno, scankey, NULL))
+
+					_bt_pages_share_parent(rel, left_blkno, right_blkno, scankey, NULL))
 				{
 					pfree(scankey);
 					relation_close(rel, AccessShareLock);
@@ -1380,7 +1388,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		 * stack->bts_blkno is the block number of the immediate parent
 		 * (level-1 page).
 		 */
-		stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ);
+		stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ, true);
 		if (stack != NULL)
 			parent_blkno = stack->bts_blkno;
 
@@ -1671,29 +1679,30 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 }
 
 Datum
-bt_merge(PG_FUNCTION_ARGS){
+bt_merge(PG_FUNCTION_ARGS)
+{
 	text	   *relname = PG_GETARG_TEXT_PP(0);
 	float8		merge_candidate_max_pct = PG_GETARG_FLOAT8(1);
 	float8		merge_destination_max_pct = PG_GETARG_FLOAT8(2);
 	int32		num_pages = PG_GETARG_INT32(3);
 	Relation	rel;
 	RangeVar   *relrv;
-	int32 		merges_performed;
+	int32		merges_performed;
 
-	
-    if (!superuser())
+
+	if (!superuser())
 		ereport(ERROR,
-			(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
-				errmsg("must be superuser to use pageinspect functions")));
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to use pageinspect functions")));
 
-    relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
+	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
 	rel = relation_openrv(relrv, AccessShareLock);
 
 	if (!IS_INDEX(rel) || !IS_BTREE(rel))
 		ereport(ERROR,
-			(errcode(ERRCODE_WRONG_OBJECT_TYPE),
-				errmsg("\"%s\" is not a %s index",
-					RelationGetRelationName(rel), "btree")));
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a %s index",
+						RelationGetRelationName(rel), "btree")));
 
 	/*
 	 * Reject attempts to read non-local temporary relations; we would be
@@ -1704,13 +1713,13 @@ bt_merge(PG_FUNCTION_ARGS){
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot access temporary tables of other sessions")));
-	
+
 
 	merges_performed = _bt_merge_index(rel, merge_candidate_max_pct, merge_destination_max_pct, num_pages);
 
-    relation_close(rel, AccessShareLock);
-	
-    
+	relation_close(rel, AccessShareLock);
+
+
 	PG_RETURN_INT32(merges_performed);
 
 }

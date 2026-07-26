@@ -1544,7 +1544,7 @@ backtrack:
 			Buffer		next_buf;
 			BTPageOpaque next_opaque;
 			BlockNumber next_blkno;
-			
+
 			BlockNumber bwd_blkno;
 			BlockNumber right_anchor;
 			Buffer		bwd_buf;
@@ -1552,15 +1552,15 @@ backtrack:
 						curr_page;
 			BTPageOpaque bwd_opaque;
 			BlockNumber nextblk;
-			
+
 			BTPageOpaqueData saved_opaque;
 			IndexTupleData trunctuple;
 
 			/**
-			 * We release the MA page lock here because the forward and backward 
-			 * walks acquire write locks on M pages. 
-			 * Holding the MA read lock across multiple buffer lock acquisitions 
-			 * would violate PostgreSQL's lock ordering rules and risk deadlock. 
+			 * We release the MA page lock here because the forward and backward
+			 * walks acquire write locks on M pages.
+			 * Holding the MA read lock across multiple buffer lock acquisitions
+			 * would violate PostgreSQL's lock ordering rules and risk deadlock.
 			 * The pin on buf is retained throughout, preventing the MA page from changes.
 			 */
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
@@ -1582,7 +1582,7 @@ backtrack:
 			while (true)
 			{
 				next_blkno = curr_opaque->btpo_next;
-				
+
 				if (next_blkno == P_NONE)
 				{
 					tail_blkno = curr_blkno;
@@ -1612,7 +1612,10 @@ backtrack:
 				curr_opaque = next_opaque;
 			}
 
-			/* Walk Backward to clear M flags (Stop before hitting the MA tombstone!) */
+			/*
+			 * Walk Backward to clear M flags (Stop before hitting the MA
+			 * tombstone!)
+			 */
 			bwd_blkno = tail_blkno;
 
 			while (bwd_blkno != blkno)
@@ -1625,7 +1628,7 @@ backtrack:
 				{
 					nextblk = bwd_opaque->btpo_next;
 					_bt_relbuf(rel, bwd_buf);
-					
+
 					bwd_buf = _bt_getbuf(rel, nextblk, BT_WRITE);
 					bwd_page = BufferGetPage(bwd_buf);
 					bwd_opaque = BTPageGetOpaque(bwd_page);
@@ -1641,8 +1644,8 @@ backtrack:
 				{
 					_bt_relbuf(rel, bwd_buf);
 					ereport(WARNING,
-						(errmsg("merged-away page %u: unexpected page state near block %u, deferring remaining cleanup to a future VACUUM",
-								blkno, bwd_blkno)));
+							(errmsg("merged-away page %u: unexpected page state near block %u, deferring remaining cleanup to a future VACUUM",
+									blkno, bwd_blkno)));
 
 					goto skip_merge_cleanup;
 				}
@@ -1658,19 +1661,20 @@ backtrack:
 				_bt_relbuf(rel, bwd_buf);
 			}
 
-			finalize_ma:
+	finalize_ma:
 
 			/* We are back at the tombstone(MA) to make it HD */
-			
+
 			/* Upgrade our read lock to a write lock while keeping the pin! */
 			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
-			if(!P_ISMERGEDAWAY(opaque) ||
-				!FullTransactionIdEquals(BTMergedAwayGetSafeXid(page), safemergexid)){
+			if (!P_ISMERGEDAWAY(opaque) ||
+				!FullTransactionIdEquals(BTMergedAwayGetSafeXid(page), safemergexid))
+			{
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 				ereport(WARNING,
-					(errmsg("merged-away page %u changed concurrently, skipping cleanup",
-							blkno)));
+						(errmsg("merged-away page %u changed concurrently, skipping cleanup",
+								blkno)));
 				goto skip_merge_cleanup;
 			}
 
@@ -1693,7 +1697,7 @@ backtrack:
 							P_HIKEY, false, false) == InvalidOffsetNumber)
 				elog(ERROR, "could not add dummy high key to half-dead page");
 
-			
+
 			opaque = BTPageGetOpaque(page);
 			*opaque = saved_opaque;
 			opaque->btpo_flags &= ~(BTP_MERGED_AWAY | BTP_HAS_FULLXID);
@@ -1703,7 +1707,7 @@ backtrack:
 
 			attempt_pagedel = true;
 
-			skip_merge_cleanup:;
+	skip_merge_cleanup:;
 		}
 	}
 	else if (P_ISLEAF(opaque))
