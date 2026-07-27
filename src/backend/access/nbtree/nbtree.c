@@ -1556,12 +1556,13 @@ backtrack:
 			BTPageOpaqueData saved_opaque;
 			IndexTupleData trunctuple;
 
-			/**
-			 * We release the MA page lock here because the forward and backward
-			 * walks acquire write locks on M pages.
-			 * Holding the MA read lock across multiple buffer lock acquisitions
-			 * would violate PostgreSQL's lock ordering rules and risk deadlock.
-			 * The pin on buf is retained throughout, preventing the MA page from changes.
+			/*
+			 * We release the MA page lock here because the forward and
+			 * backward walks acquire write locks on M pages.  Holding the MA
+			 * read lock across multiple buffer lock acquisitions would
+			 * violate PostgreSQL's lock ordering rules and risk deadlock.
+			 * The pin on buf is retained throughout, preventing the MA page
+			 * from being recycled.
 			 */
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
@@ -1570,8 +1571,10 @@ backtrack:
 			curr_page = BufferGetPage(curr_buf);
 			curr_opaque = BTPageGetOpaque(curr_page);
 
-			/**
-			 * If the last VACUUM run cleared all M page flags and stopped before clearing the MA page flag.
+			/*
+			 * If the last VACUUM run cleared all M page flags but stopped
+			 * before clearing the MA page flag, skip straight to finalizing
+			 * the tombstone.
 			 */
 			if (!BTPageIsMergedMember(curr_opaque, curr_page, blkno))
 			{
@@ -1594,9 +1597,7 @@ backtrack:
 				next_buf = _bt_getbuf(rel, next_blkno, BT_READ);
 				next_opaque = BTPageGetOpaque(BufferGetPage(next_buf));
 
-				/**
-				 * The end of the merge group was reached.
-				 */
+				/* End of the merge group reached; stop the forward walk. */
 				if (!BTPageIsMergedMember(next_opaque, BufferGetPage(next_buf), blkno))
 				{
 					tail_blkno = curr_blkno;
@@ -1634,11 +1635,13 @@ backtrack:
 					bwd_opaque = BTPageGetOpaque(bwd_page);
 				}
 
-				/**
-				 * If we stepped in a page from different Merge group, we know something is wrong and skip the cleanup.
-				 * This case is very unlikly to happen because:
-				 * 	- When a page splits, the new page also has the M flag.
-				 * 	- No other VACUUM proccess will run at the same time so no other process will reset any page in between.
+				/*
+				 * If we encounter a page from a different merge group,
+				 * something is wrong; skip the remaining cleanup and defer to
+				 * a future VACUUM.  This case is very unlikely because: -
+				 * When a page splits, the new page also inherits the M flag.
+				 * - No other VACUUM process runs concurrently on the same
+				 * index, so no other process can reset any page in between.
 				 */
 				if (!BTPageIsMergedMember(bwd_opaque, bwd_page, blkno))
 				{
@@ -1678,16 +1681,16 @@ backtrack:
 				goto skip_merge_cleanup;
 			}
 
-			/**
-			 * Stage 2 of _bt_pagedel requires a High Key to exist.
-			 */
+			/* _bt_pagedel() stage 2 requires a high key to exist on the page. */
 
 			saved_opaque = *opaque;
 
 			PageInit(page, BufferGetPageSize(buf), sizeof(BTPageOpaqueData));
-			/**
+
+			/*
 			 * TODO(WAL): move PageInit after all fallible work once
-			 * * critical-section handling is added. */
+			 * critical-section handling is added.
+			 */
 
 			MemSet(&trunctuple, 0, sizeof(IndexTupleData));
 			trunctuple.t_info = sizeof(IndexTupleData);
