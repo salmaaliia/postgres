@@ -3130,3 +3130,83 @@ _bt_pendingfsm_add(BTVacState *vstate,
 	vstate->pendingpages[vstate->npendingpages].safexid = safexid;
 	vstate->npendingpages++;
 }
+
+bool
+_bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
+					   BlockNumber right_blkno, BTScanInsert scankey, BTStack *stack_out)
+{
+	BTStack		stack;
+	Buffer		found_buf = InvalidBuffer;
+	BlockNumber parent_blkno = InvalidBlockNumber;
+	Buffer		parent_buf;
+	Page		parent_page;
+	OffsetNumber maxoff,
+				left_off;
+	bool		found_left = false;
+	IndexTuple	itup;
+	BlockNumber child;
+
+
+	/* Descend the tree to find left's parent. Caller built scankey. */
+	stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ, true);
+
+	if (BufferIsValid(found_buf))
+		UnlockReleaseBuffer(found_buf);
+
+	if (stack == NULL)
+		return false;
+
+	parent_blkno = stack->bts_blkno;
+
+	if (parent_blkno == InvalidBlockNumber)
+	{
+		_bt_freestack(stack);
+		return false;
+	}
+
+	parent_buf = ReadBuffer(rel, parent_blkno);
+	LockBuffer(parent_buf, BUFFER_LOCK_SHARE);
+	parent_page = BufferGetPage(parent_buf);
+
+	left_off = stack->bts_offset;
+
+	maxoff = PageGetMaxOffsetNumber(parent_page);
+
+	itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, left_off));
+
+	child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+	if (child == left_blkno)
+	{
+		found_left = true;
+	}
+	/**
+	 * check if off + 1 in the parent is the right sibling
+	 */
+	if (found_left)
+	{
+		OffsetNumber next_off = OffsetNumberNext(left_off);
+
+		if (next_off <= maxoff)
+		{
+			itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, next_off));
+
+			child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+			if (child == right_blkno)
+			{
+				UnlockReleaseBuffer(parent_buf);
+				if (stack_out != NULL)
+					*stack_out = stack;
+				else
+					_bt_freestack(stack);
+				return true;
+			}
+		}
+	}
+
+	UnlockReleaseBuffer(parent_buf);
+	_bt_freestack(stack);
+	return false;
+
+}
