@@ -88,12 +88,36 @@ static bool
 _bt_pages_mergeable(Page left_page, Page right_page,
 					float8 min_threshold, float8 fillfactor)
 {
+	BTPageOpaque left_opaque = BTPageGetOpaque(left_page);
 	Size		left_used = BLCKSZ - PageGetFreeSpace(left_page);
 	Size		right_used = BLCKSZ - PageGetFreeSpace(right_page);
+	Size		bytes_needed = 0;
+	OffsetNumber maxoff_left = PageGetMaxOffsetNumber(left_page);
+	OffsetNumber first_left = P_FIRSTDATAKEY(left_opaque);
 
-	return ((float8) left_used / BLCKSZ <= min_threshold &&
-			(float8) right_used / BLCKSZ <= min_threshold &&
-			(float8) (left_used + right_used) / BLCKSZ <= fillfactor);
+	/* Check individual threshold qualifications first */
+	if ((float8) left_used / BLCKSZ > min_threshold ||
+		(float8) right_used / BLCKSZ > min_threshold)
+		return false;
+
+	/* Compute exact bytes needed for all data tuples transferred from L */
+	for (OffsetNumber off = first_left; off <= maxoff_left; off++)
+	{
+		ItemId		itemid = PageGetItemId(left_page, off);
+		IndexTuple	itup = (IndexTuple) PageGetItem(left_page, itemid);
+
+		bytes_needed += MAXALIGN(IndexTupleSize(itup)) + sizeof(ItemIdData);
+	}
+
+	/* Ensure R has enough physical free space to hold all transferred tuples */
+	if (PageGetFreeSpace(right_page) < bytes_needed)
+		return false;
+
+	/* Ensure total resulting size fits within the specified fillfactor */
+	if ((float8) (right_used + bytes_needed) / BLCKSZ > fillfactor)
+		return false;
+
+	return true;
 }
 
 
@@ -310,11 +334,13 @@ _bt_mergepage(BTMergeState mstate)
 	/* Re-verify left & right leaf pages under exclusive lock. */
 	if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque) ||
 		P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque) ||
+		P_INCOMPLETE_SPLIT(left_opaque) ||
 		left_opaque->btpo_next != mstate.right_blkno)
 		goto unlock_leaf_bufs;
 
 	if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque) ||
-		P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
+		P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque) ||
+		P_INCOMPLETE_SPLIT(right_opaque))
 		goto unlock_leaf_bufs;
 
 	if (!_bt_pages_mergeable(left_page, right_page,
@@ -388,7 +414,12 @@ _bt_mergepage(BTMergeState mstate)
 	safemergexid = ReadNextFullTransactionId();
 
 	/*
-	 * CRITICAL SECTION: Mutate shared buffers.
+	 * Any failure across the three-buffer update (L becomes a tombstone, R
+	 * absorbs all tuples, parent loses R's downlink) would leave the index in
+	 * an inconsistent state.  Perform all three modifications as an atomic
+	 * unit inside a critical section so that any error panics the server
+	 * rather than aborting with a partially updated index.  WAL logging will
+	 * be added here once the redo infrastructure is in place.
 	 */
 	START_CRIT_SECTION();
 

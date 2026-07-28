@@ -1552,7 +1552,6 @@ backtrack:
 						curr_page;
 			BTPageOpaque bwd_opaque;
 			BlockNumber nextblk;
-
 			BTPageOpaqueData saved_opaque;
 			IndexTupleData trunctuple;
 
@@ -1621,6 +1620,8 @@ backtrack:
 
 			while (bwd_blkno != blkno)
 			{
+				CHECK_FOR_INTERRUPTS();
+				
 				bwd_buf = _bt_getbuf(rel, bwd_blkno, BT_WRITE);
 				bwd_page = BufferGetPage(bwd_buf);
 				bwd_opaque = BTPageGetOpaque(bwd_page);
@@ -1630,9 +1631,23 @@ backtrack:
 					nextblk = bwd_opaque->btpo_next;
 					_bt_relbuf(rel, bwd_buf);
 
+					CHECK_FOR_INTERRUPTS(); 
+
 					bwd_buf = _bt_getbuf(rel, nextblk, BT_WRITE);
 					bwd_page = BufferGetPage(bwd_buf);
 					bwd_opaque = BTPageGetOpaque(bwd_page);
+
+					if(!BTPageIsMergedMember(bwd_opaque, bwd_page, blkno))
+					{
+						_bt_relbuf(rel, bwd_buf);
+						/* Lock MA page again before skiping cleanup*/
+						LockBuffer(buf, BUFFER_LOCK_SHARE);
+						ereport(WARNING,
+								(errmsg("merged-away page %u: unexpected page state near block %u, deferring remaining cleanup to a future VACUUM",
+										blkno, bwd_blkno)));
+
+						goto skip_merge_cleanup;
+					}
 				}
 
 				/*
@@ -1646,6 +1661,9 @@ backtrack:
 				if (!BTPageIsMergedMember(bwd_opaque, bwd_page, blkno))
 				{
 					_bt_relbuf(rel, bwd_buf);
+
+					/* Lock MA page again before skiping cleanup*/
+					LockBuffer(buf, BUFFER_LOCK_SHARE);
 					ereport(WARNING,
 							(errmsg("merged-away page %u: unexpected page state near block %u, deferring remaining cleanup to a future VACUUM",
 									blkno, bwd_blkno)));
@@ -1674,7 +1692,14 @@ backtrack:
 			if (!P_ISMERGEDAWAY(opaque) ||
 				!FullTransactionIdEquals(BTMergedAwayGetSafeXid(page), safemergexid))
 			{
+				/*
+				 * Downgrade from exclusive back to share lock before jumping
+				 * to skip_merge_cleanup.  The pin is still held, so the brief
+				 * unlock window is safe.  btvacuumpage and its caller expect
+				 * buf to exit with a lock held.
+				 */
 				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
 				ereport(WARNING,
 						(errmsg("merged-away page %u changed concurrently, skipping cleanup",
 								blkno)));
@@ -1685,21 +1710,17 @@ backtrack:
 
 			saved_opaque = *opaque;
 
-			PageInit(page, BufferGetPageSize(buf), sizeof(BTPageOpaqueData));
-
-			/*
-			 * TODO(WAL): move PageInit after all fallible work once
-			 * critical-section handling is added.
-			 */
-
 			MemSet(&trunctuple, 0, sizeof(IndexTupleData));
 			trunctuple.t_info = sizeof(IndexTupleData);
 			BTreeTupleSetTopParent(&trunctuple, InvalidBlockNumber);
 
+			START_CRIT_SECTION();
+
+			PageInit(page, BufferGetPageSize(buf), sizeof(BTPageOpaqueData));
+
 			if (PageAddItem(page, (IndexTuple) &trunctuple, IndexTupleSize(&trunctuple),
 							P_HIKEY, false, false) == InvalidOffsetNumber)
-				elog(ERROR, "could not add dummy high key to half-dead page");
-
+				elog(PANIC, "could not add dummy high key to half-dead page");
 
 			opaque = BTPageGetOpaque(page);
 			*opaque = saved_opaque;
@@ -1707,10 +1728,11 @@ backtrack:
 			opaque->btpo_flags |= BTP_HALF_DEAD;
 			MarkBufferDirty(buf);
 
+			END_CRIT_SECTION();
 
 			attempt_pagedel = true;
 
-	skip_merge_cleanup:;
+	skip_merge_cleanup:
 		}
 	}
 	else if (P_ISLEAF(opaque))
