@@ -190,6 +190,12 @@ _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
 		*bufP = _bt_relandgetbuf(rel, *bufP, child, page_access);
 
 		/* okay, all set to move down a level */
+		if (strcmp(RelationGetRelationName(rel), "merge_test_idx") == 0 && opaque->btpo_level == 1 && access == BT_WRITE)
+		{
+			_bt_relbuf(rel, *bufP);
+			INJECTION_POINT("before_leaf_level", NULL);
+			*bufP = _bt_getbuf(rel, child, page_access);
+		}
 	}
 
 	/*
