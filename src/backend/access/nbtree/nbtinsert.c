@@ -1585,6 +1585,21 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	/* handle btpo_cycleid after rightpage buffer acquired */
 
 	/*
+	 * If the original page was BTP_MERGED, the left-half temp page inherits
+	 * BTP_MERGED via the btpo_flags copy above.  However, the MA block number
+	 * stored in pd_prune_xid (see BTMergedPageSetMABlkno) lives in
+	 * PageHeaderData, not BTPageOpaqueData, so it is NOT carried over by the
+	 * btpo_flags assignment.  leftpage was freshly initialized by
+	 * _bt_pageinit above, leaving pd_prune_xid as InvalidTransactionId (0).
+	 * When leftpage is later copied back into origpage (memcpy at
+	 * START_CRIT_SECTION time), the original MA block number would be
+	 * silently lost, causing amcheck to report "merged page N has invalid MA
+	 * block number 0".  Propagate it now.
+	 */
+	if (P_ISMERGED(oopaque))
+		BTMergedPageSetMABlkno(leftpage, BTMergedPageGetMABlkno(origpage));
+
+	/*
 	 * Copy the original page's LSN into leftpage, which will become the
 	 * updated version of the page.  We need this because XLogInsert will
 	 * examine the LSN and possibly dump it in a page image.

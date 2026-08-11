@@ -4,6 +4,7 @@ backend_sources += files(
   'nbtcompare.c',
   'nbtdedup.c',
   'nbtinsert.c',
+  'nbtmerge.c',
   'nbtpage.c',
   'nbtpreprocesskeys.c',
   'nbtreadpage.c',
