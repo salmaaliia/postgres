@@ -749,7 +749,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 				nbuf = _bt_relandgetbuf(rel, nbuf, nblkno, BT_READ);
 				page = BufferGetPage(nbuf);
 				opaque = BTPageGetOpaque(page);
-				if (!P_IGNORE(opaque))
+				if (!P_IGNORE(opaque) && !P_ISMERGEDAWAY(opaque))
 					break;
 				if (P_RIGHTMOST(opaque))
 					elog(ERROR, "fell off the end of index \"%s\"",
@@ -1070,7 +1070,7 @@ _bt_stepright(Relation rel, Relation heaprel, BTInsertState insertstate,
 			continue;
 		}
 
-		if (!P_IGNORE(opaque))
+		if (!P_IGNORE(opaque) && !P_ISMERGEDAWAY(opaque))
 			break;
 		if (P_RIGHTMOST(opaque))
 			elog(ERROR, "fell off the end of index \"%s\"",
