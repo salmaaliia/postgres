@@ -119,6 +119,8 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 	 */
 	newpage = PageGetTempPageCopySpecial(page);
 	PageSetLSN(newpage, PageGetLSN(page));
+	if (P_ISMERGED(opaque))
+		BTMergedPageSetMABlkno(newpage, BTMergedPageGetMABlkno(page));
 
 	/* Copy high key, if any */
 	if (!P_RIGHTMOST(opaque))
