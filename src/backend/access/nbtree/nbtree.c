@@ -1559,9 +1559,9 @@ backtrack:
 			 * We release the MA page lock here because the forward and
 			 * backward walks acquire write locks on M pages.  Holding the MA
 			 * read lock across multiple buffer lock acquisitions would
-			 * violate PostgreSQL's lock ordering rules and risk deadlock.
-			 * The pin on buf is retained throughout, preventing the MA page
-			 * from being recycled.
+			 * violate PostgreSQL's lock ordering rules and risk deadlock. The
+			 * pin on buf is retained throughout, preventing the MA page from
+			 * being recycled.
 			 */
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 
@@ -1621,7 +1621,7 @@ backtrack:
 			while (bwd_blkno != blkno)
 			{
 				CHECK_FOR_INTERRUPTS();
-				
+
 				bwd_buf = _bt_getbuf(rel, bwd_blkno, BT_WRITE);
 				bwd_page = BufferGetPage(bwd_buf);
 				bwd_opaque = BTPageGetOpaque(bwd_page);
@@ -1631,16 +1631,16 @@ backtrack:
 					nextblk = bwd_opaque->btpo_next;
 					_bt_relbuf(rel, bwd_buf);
 
-					CHECK_FOR_INTERRUPTS(); 
+					CHECK_FOR_INTERRUPTS();
 
 					bwd_buf = _bt_getbuf(rel, nextblk, BT_WRITE);
 					bwd_page = BufferGetPage(bwd_buf);
 					bwd_opaque = BTPageGetOpaque(bwd_page);
 
-					if(!BTPageIsMergedMember(bwd_opaque, bwd_page, blkno))
+					if (!BTPageIsMergedMember(bwd_opaque, bwd_page, blkno))
 					{
 						_bt_relbuf(rel, bwd_buf);
-						/* Lock MA page again before skiping cleanup*/
+						/* Lock MA page again before skiping cleanup */
 						LockBuffer(buf, BUFFER_LOCK_SHARE);
 						ereport(WARNING,
 								(errmsg("merged-away page %u: unexpected page state near block %u, deferring remaining cleanup to a future VACUUM",
@@ -1662,7 +1662,7 @@ backtrack:
 				{
 					_bt_relbuf(rel, bwd_buf);
 
-					/* Lock MA page again before skiping cleanup*/
+					/* Lock MA page again before skiping cleanup */
 					LockBuffer(buf, BUFFER_LOCK_SHARE);
 					ereport(WARNING,
 							(errmsg("merged-away page %u: unexpected page state near block %u, deferring remaining cleanup to a future VACUUM",
@@ -1731,8 +1731,6 @@ backtrack:
 			END_CRIT_SECTION();
 
 			attempt_pagedel = true;
-
-	skip_merge_cleanup:
 		}
 	}
 	else if (P_ISLEAF(opaque))
@@ -1911,6 +1909,8 @@ backtrack:
 
 		Assert(!attempt_pagedel || nhtidslive == 0);
 	}
+
+skip_merge_cleanup:
 
 	if (attempt_pagedel)
 	{
