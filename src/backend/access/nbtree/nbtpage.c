@@ -1773,7 +1773,7 @@ _bt_rightsib_halfdeadflag(Relation rel, BlockNumber leafrightsib)
 	opaque = BTPageGetOpaque(page);
 
 	Assert(P_ISLEAF(opaque) && !P_ISDELETED(opaque));
-	result = P_ISHALFDEAD(opaque);
+	result = P_ISHALFDEAD(opaque) || P_ISMERGEDAWAY(opaque);
 	_bt_relbuf(rel, buf);
 
 	return result;
@@ -2569,7 +2569,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	}
 
 	rightsib_is_rightmost = P_RIGHTMOST(opaque);
-	*rightsib_empty = (P_FIRSTDATAKEY(opaque) > PageGetMaxOffsetNumber(page));
+	*rightsib_empty = !P_ISMERGEDAWAY(opaque) && (P_FIRSTDATAKEY(opaque) > PageGetMaxOffsetNumber(page));
 
 	/*
 	 * If we are deleting the next-to-last page on the target's level, then

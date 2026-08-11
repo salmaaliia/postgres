@@ -967,7 +967,7 @@ _bt_check_natts(Relation rel, bool heapkeyspace, Page page, OffsetNumber offnum)
 	 * We cannot reliably test a deleted or half-dead page, since they have
 	 * dummy high keys
 	 */
-	if (P_IGNORE(opaque))
+	if (P_IGNORE(opaque) || P_ISMERGEDAWAY(opaque))
 		return true;
 
 	Assert(offnum >= FirstOffsetNumber &&

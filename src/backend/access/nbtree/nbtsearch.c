@@ -317,7 +317,7 @@ _bt_moveright(Relation rel,
 			continue;
 		}
 
-		if (P_IGNORE(opaque) || _bt_compare(rel, key, page, P_HIKEY) >= cmpval)
+		if (P_IGNORE(opaque) || P_ISMERGEDAWAY(opaque) || _bt_compare(rel, key, page, P_HIKEY) >= cmpval)
 		{
 			/* step right one page */
 			buf = _bt_relandgetbuf(rel, buf, opaque->btpo_next, access);
@@ -1782,6 +1782,7 @@ _bt_readfirstpage(IndexScanDesc scan, OffsetNumber offnum, ScanDirection dir)
 		if (P_ISMERGED(opaque))
 		{
 			so->skipMergeRecovery = true;
+			so->mergedAwayBlkno = BTMergedPageGetMABlkno(page);
 		}
 	}
 
@@ -2588,7 +2589,7 @@ _bt_get_endpoint(Relation rel, uint32 level, bool rightmost)
 		 * right if needed to get to it (this could happen if the page split
 		 * since we obtained a pointer to it).
 		 */
-		while (P_IGNORE(opaque) ||
+		while (P_IGNORE(opaque) || P_ISMERGEDAWAY(opaque) ||
 			   (rightmost && !P_RIGHTMOST(opaque)))
 		{
 			blkno = opaque->btpo_next;
