@@ -1000,6 +1000,121 @@ btree_xlog_reuse_page(XLogReaderState *record)
 												   xlrec->locator);
 }
 
+static void
+btree_xlog_merge_page(XLogReaderState *record)
+{
+	xl_btree_merge *xlrec = (xl_btree_merge *) XLogRecGetData(record);
+	XLogRecPtr	lsn = record->EndRecPtr;
+	Buffer		buf;
+	Page		page;
+	BTPageOpaque pageop;
+	
+
+	if(xlrec->action == XLOG_BTREE_MERGE_PAGES){
+		/* parent page */
+		if(XLogReadBufferForRedo(record, 2, &buf) == BLK_NEEDS_REDO){
+			OffsetNumber poffset;
+			ItemId		itemid;
+			IndexTuple	itup;
+			OffsetNumber nextoffset;
+			BlockNumber rightsib;
+
+			page = BufferGetPage(buf);
+			pageop = BTPageGetOpaque(page);
+
+			poffset = xlrec->poffset;
+
+			nextoffset = OffsetNumberNext(poffset);
+			itemid = PageGetItemId(page, nextoffset);
+			itup = (IndexTuple) PageGetItem(page, itemid);
+			rightsib = BTreeTupleGetDownLink(itup);
+
+			itemid = PageGetItemId(page, poffset);
+			itup = (IndexTuple) PageGetItem(page, itemid);
+			BTreeTupleSetDownLink(itup, rightsib);
+			nextoffset = OffsetNumberNext(poffset);
+			PageIndexTupleDelete(page, nextoffset);
+
+			PageSetLSN(page, lsn);
+			MarkBufferDirty(buf);
+		}
+
+		if (BufferIsValid(buf))
+    		UnlockReleaseBuffer(buf);
+
+
+		/* Reconstruct	left (MA) page from scratch */
+		buf = XLogInitBufferForRedo(record, 0);
+		page = BufferGetPage(buf);
+
+		_bt_pageinit(page, BufferGetPageSize(buf));
+		pageop = BTPageGetOpaque(page);
+
+		pageop->btpo_prev = xlrec->left_prev;
+		pageop->btpo_next = xlrec->left_next;
+		pageop->btpo_level = 0;
+		pageop->btpo_flags =  BTP_LEAF;
+		pageop->btpo_cycleid = 0;
+
+		BTPageSetMergedAway(page, xlrec->safemergexid);
+
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(buf);
+		UnlockReleaseBuffer(buf);
+
+		/* right (M) page */
+		XLogReadBufferForRedo(record, 1, &buf);
+
+		if (BufferIsValid(buf))
+    		UnlockReleaseBuffer(buf);
+	}
+	else if(xlrec->action == XLOG_BTREE_CLEAR_MERGE_FLAG)
+	{
+		if(XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
+		{
+			page = BufferGetPage(buf);
+			pageop = BTPageGetOpaque(page);
+
+			BTMergedPageClearMABlkno(page);
+			pageop->btpo_flags &= ~BTP_MERGED;
+
+			PageSetLSN(page, lsn);
+			MarkBufferDirty(buf);
+		}
+		if (BufferIsValid(buf))
+    		UnlockReleaseBuffer(buf);
+
+	}
+	else if(xlrec->action == XLOG_BTREE_MERGE_MARK_HALFDEAD)
+	{
+		IndexTupleData trunctuple;
+    	/* Rewrite the MA page as a halfdead page */
+		buf = XLogInitBufferForRedo(record, 0);
+		page = BufferGetPage(buf);
+
+		_bt_pageinit(page, BufferGetPageSize(buf));
+		pageop = BTPageGetOpaque(page);
+
+		pageop->btpo_prev = xlrec->left_prev;
+		pageop->btpo_next = xlrec->left_next;
+		pageop->btpo_level = 0;
+		pageop->btpo_flags = BTP_HALF_DEAD | BTP_LEAF;
+		pageop->btpo_cycleid = 0;
+
+
+		MemSet(&trunctuple, 0, sizeof(IndexTupleData));
+		trunctuple.t_info = sizeof(IndexTupleData);
+		BTreeTupleSetTopParent(&trunctuple, InvalidBlockNumber);
+
+		if (PageAddItem(page, &trunctuple, sizeof(IndexTupleData), P_HIKEY, false, false) == InvalidOffsetNumber)
+			elog(ERROR, "could not add dummy high key to half-dead page");
+
+		PageSetLSN(page, lsn);
+		MarkBufferDirty(buf);
+		UnlockReleaseBuffer(buf);
+	}
+}
+
 void
 btree_redo(XLogReaderState *record)
 {
@@ -1051,6 +1166,9 @@ btree_redo(XLogReaderState *record)
 			break;
 		case XLOG_BTREE_META_CLEANUP:
 			_bt_restore_meta(record, 0);
+			break;
+		case XLOG_BTREE_MERGE:
+			btree_xlog_merge_page(record);
 			break;
 		default:
 			elog(PANIC, "btree_redo: unknown op code %u", info);

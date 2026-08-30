@@ -19,6 +19,8 @@
 
 #include "access/nbtree.h"
 #include "access/tableam.h"
+#include "access/nbtxlog.h"
+#include "access/xloginsert.h"
 #include "common/int.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
@@ -41,7 +43,7 @@ typedef struct BTMergeState
 static int32 _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_limit);
 static bool _bt_mergepage(BTMergeState mstate);
 static BTScanInsert _bt_merge_mkscankey(Relation rel, Page page, BTPageOpaque opaque);
-static bool _bt_pages_mergeable(Page left_page, Page right_page, float8 min_threshold, float8 fillfactor);
+static bool _bt_pages_mergeable(Page leftpage, Page rightpage, float8 min_threshold, float8 fillfactor);
 
 
 /*
@@ -85,15 +87,15 @@ _bt_merge_mkscankey(Relation rel, Page page, BTPageOpaque opaque)
  * space must fit within fillfactor.  Thresholds are fractions (0.0 - 1.0).
  */
 static bool
-_bt_pages_mergeable(Page left_page, Page right_page,
+_bt_pages_mergeable(Page leftpage, Page rightpage,
 					float8 min_threshold, float8 fillfactor)
 {
-	BTPageOpaque left_opaque = BTPageGetOpaque(left_page);
-	Size		left_used = BLCKSZ - PageGetFreeSpace(left_page);
-	Size		right_used = BLCKSZ - PageGetFreeSpace(right_page);
+	BTPageOpaque leftopaque = BTPageGetOpaque(leftpage);
+	Size		left_used = BLCKSZ - PageGetFreeSpace(leftpage);
+	Size		right_used = BLCKSZ - PageGetFreeSpace(rightpage);
 	Size		bytes_needed = 0;
-	OffsetNumber maxoff_left = PageGetMaxOffsetNumber(left_page);
-	OffsetNumber first_left = P_FIRSTDATAKEY(left_opaque);
+	OffsetNumber maxoff_left = PageGetMaxOffsetNumber(leftpage);
+	OffsetNumber first_left = P_FIRSTDATAKEY(leftopaque);
 
 	/* Check individual threshold qualifications first */
 	if ((float8) left_used / BLCKSZ > min_threshold ||
@@ -103,14 +105,14 @@ _bt_pages_mergeable(Page left_page, Page right_page,
 	/* Compute exact bytes needed for all data tuples transferred from L */
 	for (OffsetNumber off = first_left; off <= maxoff_left; off++)
 	{
-		ItemId		itemid = PageGetItemId(left_page, off);
-		IndexTuple	itup = (IndexTuple) PageGetItem(left_page, itemid);
+		ItemId		itemid = PageGetItemId(leftpage, off);
+		IndexTuple	itup = (IndexTuple) PageGetItem(leftpage, itemid);
 
 		bytes_needed += MAXALIGN(IndexTupleSize(itup)) + sizeof(ItemIdData);
 	}
 
 	/* Ensure R has enough physical free space to hold all transferred tuples */
-	if (PageGetFreeSpace(right_page) < bytes_needed)
+	if (PageGetFreeSpace(rightpage) < bytes_needed)
 		return false;
 
 	/* Ensure total resulting size fits within the specified fillfactor */
@@ -135,13 +137,13 @@ _bt_pages_mergeable(Page left_page, Page right_page,
 static int32
 _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_limit)
 {
-	Buffer		left_buf,
-				right_buf;
-	Page		left_page,
-				right_page,
+	Buffer		leftbuf,
+				rightbuf;
+	Page		leftpage,
+				rightpage,
 				temp_page;
-	BTPageOpaque left_opaque,
-				right_opaque,
+	BTPageOpaque leftopaque,
+				rightopaque,
 				temp_opaque;
 	BlockNumber left_blkno,
 				right_blkno,
@@ -177,55 +179,55 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 
 		/* Pin and share-lock the left candidate. */
 		left_blkno = current_blkno;
-		left_buf = ReadBuffer(rel, left_blkno);
-		LockBuffer(left_buf, BUFFER_LOCK_SHARE);
-		left_page = BufferGetPage(left_buf);
-		left_opaque = BTPageGetOpaque(left_page);
+		leftbuf = ReadBuffer(rel, left_blkno);
+		LockBuffer(leftbuf, BUFFER_LOCK_SHARE);
+		leftpage = BufferGetPage(leftbuf);
+		leftopaque = BTPageGetOpaque(leftpage);
 
-		if (P_RIGHTMOST(left_opaque))
+		if (P_RIGHTMOST(leftopaque))
 		{
-			UnlockReleaseBuffer(left_buf);
+			UnlockReleaseBuffer(leftbuf);
 			return merges_performed;
 		}
 
-		if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
-			|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
+		if (P_ISDELETED(leftopaque) || P_ISHALFDEAD(leftopaque)
+			|| P_ISMERGED(leftopaque) || P_ISMERGEDAWAY(leftopaque))
 		{
-			current_blkno = left_opaque->btpo_next;
-			UnlockReleaseBuffer(left_buf);
+			current_blkno = leftopaque->btpo_next;
+			UnlockReleaseBuffer(leftbuf);
 			continue;
 		}
 
-		Assert(P_ISLEAF(left_opaque));
+		Assert(P_ISLEAF(leftopaque));
 
 		/* Pin and share-lock the right candidate. */
-		right_blkno = left_opaque->btpo_next;
-		right_buf = ReadBuffer(rel, right_blkno);
-		LockBuffer(right_buf, BUFFER_LOCK_SHARE);
-		right_page = BufferGetPage(right_buf);
-		right_opaque = BTPageGetOpaque(right_page);
+		right_blkno = leftopaque->btpo_next;
+		rightbuf = ReadBuffer(rel, right_blkno);
+		LockBuffer(rightbuf, BUFFER_LOCK_SHARE);
+		rightpage = BufferGetPage(rightbuf);
+		rightopaque = BTPageGetOpaque(rightpage);
 
-		if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
-			|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
+		if (P_ISDELETED(rightopaque) || P_ISHALFDEAD(rightopaque)
+			|| P_ISMERGED(rightopaque) || P_ISMERGEDAWAY(rightopaque))
 		{
-			current_blkno = right_opaque->btpo_next;
-			UnlockReleaseBuffer(right_buf);
-			UnlockReleaseBuffer(left_buf);
+			current_blkno = rightopaque->btpo_next;
+			UnlockReleaseBuffer(rightbuf);
+			UnlockReleaseBuffer(leftbuf);
 			continue;
 		}
 
-		Assert(P_ISLEAF(right_opaque));
+		Assert(P_ISLEAF(rightopaque));
 
 		/* Save R's right sibling while we still hold the share lock on R. */
-		r_right_blkno = right_opaque->btpo_next;
+		r_right_blkno = rightopaque->btpo_next;
 
 		/* L is examined; slide the window to R as the default next-left. */
 		num_pages++;
 		current_blkno = right_blkno;
 
-		scankey = _bt_merge_mkscankey(rel, left_page, left_opaque);
+		scankey = _bt_merge_mkscankey(rel, leftpage, leftopaque);
 
-		if (_bt_pages_mergeable(left_page, right_page,
+		if (_bt_pages_mergeable(leftpage, rightpage,
 								mstate.min_threshold, mstate.fillfactor) &&
 			scankey != NULL)
 		{
@@ -239,8 +241,8 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 			 */
 			num_pages++;
 			current_blkno = r_right_blkno;
-			UnlockReleaseBuffer(right_buf);
-			UnlockReleaseBuffer(left_buf);
+			UnlockReleaseBuffer(rightbuf);
+			UnlockReleaseBuffer(leftbuf);
 
 			if (_bt_pages_share_parent(rel, left_blkno, right_blkno,
 									   scankey, &stack))
@@ -260,8 +262,8 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		}
 
 		/* Pages don't qualify; current_blkno already points at R. */
-		UnlockReleaseBuffer(right_buf);
-		UnlockReleaseBuffer(left_buf);
+		UnlockReleaseBuffer(rightbuf);
+		UnlockReleaseBuffer(leftbuf);
 		if (scankey)
 			pfree(scankey);
 	}
@@ -291,15 +293,15 @@ _bt_mergepage(BTMergeState mstate)
 {
 	Relation	rel = mstate.rel;
 	BlockNumber parent_blkno;
-	Buffer		left_buf,
-				right_buf,
-				parent_buf = InvalidBuffer;
-	Page		left_page,
-				right_page,
-				parent_page;
-	BTPageOpaque left_opaque,
-				right_opaque,
-				parent_opaque;
+	Buffer		leftbuf,
+				rightbuf,
+				parentbuf = InvalidBuffer;
+	Page		leftpage,
+				rightpage,
+				parentpage;
+	BTPageOpaque leftopaque,
+				rightopaque,
+				popaque;
 	BTStack		stack = mstate.stack;
 	ItemId		itemid;
 	IndexTuple	itup,
@@ -314,36 +316,37 @@ _bt_mergepage(BTMergeState mstate)
 	BTPageOpaqueData saved_opaque;
 	FullTransactionId safemergexid;
 	bool		merged = false;
+	XLogRecPtr	recptr;
 
 	parent_blkno = stack->bts_blkno;
 
-	left_buf = ReadBuffer(rel, mstate.left_blkno);
-	LockBuffer(left_buf, BT_WRITE);
-	left_page = BufferGetPage(left_buf);
-	left_opaque = BTPageGetOpaque(left_page);
-	Assert(P_ISLEAF(left_opaque));
+	leftbuf = ReadBuffer(rel, mstate.left_blkno);
+	LockBuffer(leftbuf, BT_WRITE);
+	leftpage = BufferGetPage(leftbuf);
+	leftopaque = BTPageGetOpaque(leftpage);
+	Assert(P_ISLEAF(leftopaque));
 
 	INJECTION_POINT("after_left_lock", NULL);
 
-	right_buf = ReadBuffer(rel, mstate.right_blkno);
-	LockBuffer(right_buf, BT_WRITE);
-	right_page = BufferGetPage(right_buf);
-	right_opaque = BTPageGetOpaque(right_page);
-	Assert(P_ISLEAF(right_opaque));
+	rightbuf = ReadBuffer(rel, mstate.right_blkno);
+	LockBuffer(rightbuf, BT_WRITE);
+	rightpage = BufferGetPage(rightbuf);
+	rightopaque = BTPageGetOpaque(rightpage);
+	Assert(P_ISLEAF(rightopaque));
 
 	/* Re-verify left & right leaf pages under exclusive lock. */
-	if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque) ||
-		P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque) ||
-		P_INCOMPLETE_SPLIT(left_opaque) ||
-		left_opaque->btpo_next != mstate.right_blkno)
+	if (P_ISDELETED(leftopaque) || P_ISHALFDEAD(leftopaque) ||
+		P_ISMERGED(leftopaque) || P_ISMERGEDAWAY(leftopaque) ||
+		P_INCOMPLETE_SPLIT(leftopaque) ||
+		leftopaque->btpo_next != mstate.right_blkno)
 		goto unlock_leaf_bufs;
 
-	if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque) ||
-		P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque) ||
-		P_INCOMPLETE_SPLIT(right_opaque))
+	if (P_ISDELETED(rightopaque) || P_ISHALFDEAD(rightopaque) ||
+		P_ISMERGED(rightopaque) || P_ISMERGEDAWAY(rightopaque) ||
+		P_INCOMPLETE_SPLIT(rightopaque))
 		goto unlock_leaf_bufs;
 
-	if (!_bt_pages_mergeable(left_page, right_page,
+	if (!_bt_pages_mergeable(leftpage, rightpage,
 							 mstate.min_threshold, mstate.fillfactor))
 		goto unlock_leaf_bufs;
 
@@ -351,50 +354,50 @@ _bt_mergepage(BTMergeState mstate)
 	 * Lock the parent and confirm that downlinks at bts_offset and
 	 * bts_offset+1 still point to L and R respectively.
 	 */
-	parent_buf = ReadBuffer(rel, parent_blkno);
-	LockBuffer(parent_buf, BT_WRITE);
-	parent_page = BufferGetPage(parent_buf);
-	parent_opaque = BTPageGetOpaque(parent_page);
+	parentbuf = ReadBuffer(rel, parent_blkno);
+	LockBuffer(parentbuf, BT_WRITE);
+	parentpage = BufferGetPage(parentbuf);
+	popaque = BTPageGetOpaque(parentpage);
 
-	if (P_ISDELETED(parent_opaque) || P_ISHALFDEAD(parent_opaque) ||
-		parent_opaque->btpo_level != left_opaque->btpo_level + 1)
+	if (P_ISDELETED(popaque) || P_ISHALFDEAD(popaque) ||
+		popaque->btpo_level != leftopaque->btpo_level + 1)
 		goto unlock_all_bufs;
 
 	next_off = OffsetNumberNext(stack->bts_offset);
-	if (stack->bts_offset < P_FIRSTDATAKEY(parent_opaque) ||
-		next_off > PageGetMaxOffsetNumber(parent_page))
+	if (stack->bts_offset < P_FIRSTDATAKEY(popaque) ||
+		next_off > PageGetMaxOffsetNumber(parentpage))
 		goto unlock_all_bufs;
 
 	/* Verify L's downlink */
-	itemid = PageGetItemId(parent_page, stack->bts_offset);
+	itemid = PageGetItemId(parentpage, stack->bts_offset);
 	if (!ItemIdIsNormal(itemid))
 		goto unlock_all_bufs;
-	left_itup = (IndexTuple) PageGetItem(parent_page, itemid);
+	left_itup = (IndexTuple) PageGetItem(parentpage, itemid);
 	if (BTreeTupleGetDownLink(left_itup) != mstate.left_blkno)
 		goto unlock_all_bufs;
 
 	/* Verify R's downlink */
-	itemid = PageGetItemId(parent_page, next_off);
+	itemid = PageGetItemId(parentpage, next_off);
 	if (!ItemIdIsNormal(itemid))
 		goto unlock_all_bufs;
-	itup = (IndexTuple) PageGetItem(parent_page, itemid);
+	itup = (IndexTuple) PageGetItem(parentpage, itemid);
 	if (BTreeTupleGetDownLink(itup) != mstate.right_blkno)
 		goto unlock_all_bufs;
 
 	/* Save R's high key (if not rightmost). */
-	if (!P_RIGHTMOST(right_opaque))
+	if (!P_RIGHTMOST(rightopaque))
 	{
-		ItemId		hikey_id = PageGetItemId(right_page, P_HIKEY);
+		ItemId		hikey_id = PageGetItemId(rightpage, P_HIKEY);
 
 		r_hikey_size = ItemIdGetLength(hikey_id);
 		r_hikey = (IndexTuple) palloc(r_hikey_size);
-		memcpy(r_hikey, PageGetItem(right_page, hikey_id), r_hikey_size);
+		memcpy(r_hikey, PageGetItem(rightpage, hikey_id), r_hikey_size);
 	}
 
 	/* Save all of R's data tuples into temporary memory. */
 	{
-		OffsetNumber r_start = P_FIRSTDATAKEY(right_opaque);
-		OffsetNumber r_maxoff = PageGetMaxOffsetNumber(right_page);
+		OffsetNumber r_start = P_FIRSTDATAKEY(rightopaque);
+		OffsetNumber r_maxoff = PageGetMaxOffsetNumber(rightpage);
 
 		n_right = (r_maxoff >= r_start) ? (r_maxoff - r_start + 1) : 0;
 		r_tuples = palloc_array(IndexTuple, n_right);
@@ -402,9 +405,9 @@ _bt_mergepage(BTMergeState mstate)
 
 		for (int i = 0; i < n_right; i++)
 		{
-			itemid = PageGetItemId(right_page, r_start + i);
+			itemid = PageGetItemId(rightpage, r_start + i);
 			sz = ItemIdGetLength(itemid);
-			itup = (IndexTuple) PageGetItem(right_page, itemid);
+			itup = (IndexTuple) PageGetItem(rightpage, itemid);
 			r_tuples[i] = (IndexTuple) palloc(sz);
 			memcpy(r_tuples[i], itup, sz);
 			r_sizes[i] = sz;
@@ -418,33 +421,32 @@ _bt_mergepage(BTMergeState mstate)
 	 * absorbs all tuples, parent loses R's downlink) would leave the index in
 	 * an inconsistent state.  Perform all three modifications as an atomic
 	 * unit inside a critical section so that any error panics the server
-	 * rather than aborting with a partially updated index.  WAL logging will
-	 * be added here once the redo infrastructure is in place.
+	 * rather than aborting with a partially updated index. 
 	 */
 	START_CRIT_SECTION();
 
 	/* Reinitialize R, preserving its opaque header. */
-	saved_opaque = *right_opaque;
-	PageInit(right_page, BufferGetPageSize(right_buf), sizeof(BTPageOpaqueData));
-	*BTPageGetOpaque(right_page) = saved_opaque;
+	saved_opaque = *rightopaque;
+	PageInit(rightpage, BufferGetPageSize(rightbuf), sizeof(BTPageOpaqueData));
+	*BTPageGetOpaque(rightpage) = saved_opaque;
 
 	if (r_hikey != NULL)
 	{
-		if (PageAddItem(right_page, r_hikey, r_hikey_size,
+		if (PageAddItem(rightpage, r_hikey, r_hikey_size,
 						P_HIKEY, false, false) == InvalidOffsetNumber)
 			elog(PANIC, "failed to restore high key to merged page");
 	}
 
 	/* Copy L's data tuples into R. */
-	for (OffsetNumber off = P_FIRSTDATAKEY(left_opaque);
-		 off <= PageGetMaxOffsetNumber(left_page);
+	for (OffsetNumber off = P_FIRSTDATAKEY(leftopaque);
+		 off <= PageGetMaxOffsetNumber(leftpage);
 		 off++)
 	{
-		itemid = PageGetItemId(left_page, off);
+		itemid = PageGetItemId(leftpage, off);
 		sz = ItemIdGetLength(itemid);
-		itup = (IndexTuple) PageGetItem(left_page, itemid);
+		itup = (IndexTuple) PageGetItem(leftpage, itemid);
 
-		if (PageAddItem(right_page, itup, sz,
+		if (PageAddItem(rightpage, itup, sz,
 						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
 			elog(PANIC, "failed to copy left tuple to merged page");
 	}
@@ -452,22 +454,49 @@ _bt_mergepage(BTMergeState mstate)
 	/* Append R's original data tuples after L's. */
 	for (int i = 0; i < n_right; i++)
 	{
-		if (PageAddItem(right_page, r_tuples[i], r_sizes[i],
+		if (PageAddItem(rightpage, r_tuples[i], r_sizes[i],
 						InvalidOffsetNumber, false, false) == InvalidOffsetNumber)
 			elog(PANIC, "failed to copy right tuple to merged page");
 	}
 
 	/* Redirect L's downlink to R and delete R's downlink entry. */
 	BTreeTupleSetDownLink(left_itup, mstate.right_blkno);
-	PageIndexTupleDelete(parent_page, next_off);
+	PageIndexTupleDelete(parentpage, next_off);
 
-	BTPageSetMerged(right_page);
-	BTMergedPageSetMABlkno(right_page, mstate.left_blkno);
-	BTPageSetMergedAway(left_page, safemergexid);
+	BTPageSetMerged(rightpage);
+	BTMergedPageSetMABlkno(rightpage, mstate.left_blkno);
+	BTPageSetMergedAway(leftpage, safemergexid);
 
-	MarkBufferDirty(left_buf);
-	MarkBufferDirty(right_buf);
-	MarkBufferDirty(parent_buf);
+	MarkBufferDirty(leftbuf);
+	MarkBufferDirty(rightbuf);
+	MarkBufferDirty(parentbuf);
+
+	if(RelationNeedsWAL(rel))
+	{
+		xl_btree_merge xlrec;
+
+		xlrec.left_prev = leftopaque->btpo_prev;
+		xlrec.left_next = mstate.right_blkno;
+		xlrec.poffset = stack->bts_offset;
+		xlrec.safemergexid = safemergexid;
+		xlrec.action = XLOG_BTREE_MERGE_PAGES;
+
+		XLogBeginInsert();
+		XLogRegisterData(&xlrec, SizeOfBtreeMerge);
+
+		XLogRegisterBuffer(0, leftbuf, REGBUF_WILL_INIT);
+		XLogRegisterBuffer(1, rightbuf, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
+		XLogRegisterBuffer(2, parentbuf, REGBUF_STANDARD);
+
+		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MERGE);
+	}
+	else
+		recptr = XLogGetFakeLSN(rel);
+
+	PageSetLSN(leftpage,   recptr);
+    PageSetLSN(rightpage,  recptr);
+    PageSetLSN(parentpage, recptr);
+
 
 	END_CRIT_SECTION();
 
@@ -483,11 +512,11 @@ _bt_mergepage(BTMergeState mstate)
 	merged = true;
 
 unlock_all_bufs:
-	UnlockReleaseBuffer(parent_buf);
+	UnlockReleaseBuffer(parentbuf);
 
 unlock_leaf_bufs:
-	UnlockReleaseBuffer(right_buf);
-	UnlockReleaseBuffer(left_buf);
+	UnlockReleaseBuffer(rightbuf);
+	UnlockReleaseBuffer(leftbuf);
 
 	return merged;
 }
