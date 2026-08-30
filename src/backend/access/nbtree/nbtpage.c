@@ -3138,8 +3138,8 @@ _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 	BTStack		stack;
 	Buffer		found_buf = InvalidBuffer;
 	BlockNumber parent_blkno = InvalidBlockNumber;
-	Buffer		parent_buf;
-	Page		parent_page;
+	Buffer		parentbuf;
+	Page		parentpage;
 	OffsetNumber maxoff,
 				left_off;
 	bool		found_left = false;
@@ -3164,15 +3164,15 @@ _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 		return false;
 	}
 
-	parent_buf = ReadBuffer(rel, parent_blkno);
-	LockBuffer(parent_buf, BUFFER_LOCK_SHARE);
-	parent_page = BufferGetPage(parent_buf);
+	parentbuf = ReadBuffer(rel, parent_blkno);
+	LockBuffer(parentbuf, BUFFER_LOCK_SHARE);
+	parentpage = BufferGetPage(parentbuf);
 
 	left_off = stack->bts_offset;
 
-	maxoff = PageGetMaxOffsetNumber(parent_page);
+	maxoff = PageGetMaxOffsetNumber(parentpage);
 
-	itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, left_off));
+	itup = (IndexTuple) PageGetItem(parentpage, PageGetItemId(parentpage, left_off));
 
 	child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
 
@@ -3189,13 +3189,13 @@ _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 
 		if (next_off <= maxoff)
 		{
-			itup = (IndexTuple) PageGetItem(parent_page, PageGetItemId(parent_page, next_off));
+			itup = (IndexTuple) PageGetItem(parentpage, PageGetItemId(parentpage, next_off));
 
 			child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
 
 			if (child == right_blkno)
 			{
-				UnlockReleaseBuffer(parent_buf);
+				UnlockReleaseBuffer(parentbuf);
 				if (stack_out != NULL)
 					*stack_out = stack;
 				else
@@ -3205,7 +3205,7 @@ _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 		}
 	}
 
-	UnlockReleaseBuffer(parent_buf);
+	UnlockReleaseBuffer(parentbuf);
 	_bt_freestack(stack);
 	return false;
 
