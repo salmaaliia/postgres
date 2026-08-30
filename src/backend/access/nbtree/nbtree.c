@@ -21,6 +21,8 @@
 #include "access/nbtree.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
+#include "access/nbtxlog.h"
+#include "access/xloginsert.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "nodes/execnodes.h"
@@ -1554,6 +1556,7 @@ backtrack:
 			BlockNumber nextblk;
 			BTPageOpaqueData saved_opaque;
 			IndexTupleData trunctuple;
+			XLogRecPtr	recptr;
 
 			/*
 			 * We release the MA page lock here because the forward and
@@ -1671,11 +1674,31 @@ backtrack:
 					goto skip_merge_cleanup;
 				}
 
+				START_CRIT_SECTION();
+
 				bwd_opaque->btpo_flags &= ~(BTP_MERGED);
 				BTMergedPageClearMABlkno(bwd_page);
 				MarkBufferDirty(bwd_buf);
 
-				/* TODO: (WAL) needs a critical section + XLOG record */
+				if(RelationNeedsWAL(rel))
+				{
+					xl_btree_merge xlrec = {0};
+					xlrec.action = XLOG_BTREE_CLEAR_MERGE_FLAG;
+
+					XLogBeginInsert();
+
+					XLogRegisterData(&xlrec, SizeOfBtreeMerge);
+
+					XLogRegisterBuffer(0, bwd_buf, REGBUF_STANDARD);
+
+					recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MERGE);
+				}
+				else
+					recptr = XLogGetFakeLSN(rel);
+
+				PageSetLSN(bwd_page,   recptr);
+
+				END_CRIT_SECTION();
 
 				right_anchor = BufferGetBlockNumber(bwd_buf);
 				bwd_blkno = bwd_opaque->btpo_prev;
@@ -1727,6 +1750,27 @@ backtrack:
 			opaque->btpo_flags &= ~(BTP_MERGED_AWAY | BTP_HAS_FULLXID);
 			opaque->btpo_flags |= BTP_HALF_DEAD;
 			MarkBufferDirty(buf);
+
+
+			if(RelationNeedsWAL(rel))
+			{
+				xl_btree_merge xlrec = {0};
+				xlrec.action = XLOG_BTREE_MERGE_MARK_HALFDEAD;
+				xlrec.left_prev = opaque->btpo_prev;
+				xlrec.left_next = opaque->btpo_next;
+
+				XLogBeginInsert();
+
+				XLogRegisterData(&xlrec, SizeOfBtreeMerge);
+
+				XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
+
+				recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MERGE);
+			}
+			else
+				recptr = XLogGetFakeLSN(rel);
+
+			PageSetLSN(page,   recptr);
 
 			END_CRIT_SECTION();
 

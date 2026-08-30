@@ -1019,12 +1019,12 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 	FuncCallContext *fctx;
 	MemoryContext mctx;
 	ua_merge_candidates *uargs;
-	Buffer		left_buf,
-				right_buf;
-	Page		left_page,
-				right_page;
-	BTPageOpaque left_opaque,
-				right_opaque;
+	Buffer		leftbuf,
+				rightbuf;
+	Page		leftpage,
+				rightpage;
+	BTPageOpaque leftopaque,
+				rightopaque;
 	BlockNumber left_blkno,
 				right_blkno;
 	Size		left_free,
@@ -1121,58 +1121,58 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 			}
 
 			left_blkno = uargs->current_blkno;
-			left_buf = ReadBuffer(rel, left_blkno);
-			LockBuffer(left_buf, BUFFER_LOCK_SHARE);
-			left_page = BufferGetPage(left_buf);
-			left_opaque = BTPageGetOpaque(left_page);
+			leftbuf = ReadBuffer(rel, left_blkno);
+			LockBuffer(leftbuf, BUFFER_LOCK_SHARE);
+			leftpage = BufferGetPage(leftbuf);
+			leftopaque = BTPageGetOpaque(leftpage);
 
-			if (P_RIGHTMOST(left_opaque))
+			if (P_RIGHTMOST(leftopaque))
 			{
-				UnlockReleaseBuffer(left_buf);
+				UnlockReleaseBuffer(leftbuf);
 				relation_close(rel, AccessShareLock);
 				SRF_RETURN_DONE(fctx);
 			}
 
 			/* Skip deleted, half-dead, and already-merged pages. */
-			if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque)
-				|| P_ISMERGED(left_opaque) || P_ISMERGEDAWAY(left_opaque))
+			if (P_ISDELETED(leftopaque) || P_ISHALFDEAD(leftopaque)
+				|| P_ISMERGED(leftopaque) || P_ISMERGEDAWAY(leftopaque))
 			{
-				uargs->current_blkno = left_opaque->btpo_next;
-				UnlockReleaseBuffer(left_buf);
+				uargs->current_blkno = leftopaque->btpo_next;
+				UnlockReleaseBuffer(leftbuf);
 				continue;
 			}
 
-			Assert(P_ISLEAF(left_opaque));
+			Assert(P_ISLEAF(leftopaque));
 
 			/* Lock couple: acquire right BEFORE releasing left */
-			right_blkno = left_opaque->btpo_next;
-			left_free = PageGetFreeSpace(left_page);
-			right_buf = ReadBuffer(rel, right_blkno);
-			LockBuffer(right_buf, BUFFER_LOCK_SHARE);
-			right_page = BufferGetPage(right_buf);
-			right_opaque = BTPageGetOpaque(right_page);
-			right_free = PageGetFreeSpace(right_page);
+			right_blkno = leftopaque->btpo_next;
+			left_free = PageGetFreeSpace(leftpage);
+			rightbuf = ReadBuffer(rel, right_blkno);
+			LockBuffer(rightbuf, BUFFER_LOCK_SHARE);
+			rightpage = BufferGetPage(rightbuf);
+			rightopaque = BTPageGetOpaque(rightpage);
+			right_free = PageGetFreeSpace(rightpage);
 
 			/* R is unusable; skip directly past it using its btpo_next. */
-			if (P_ISDELETED(right_opaque) || P_ISHALFDEAD(right_opaque)
-				|| P_ISMERGED(right_opaque) || P_ISMERGEDAWAY(right_opaque))
+			if (P_ISDELETED(rightopaque) || P_ISHALFDEAD(rightopaque)
+				|| P_ISMERGED(rightopaque) || P_ISMERGEDAWAY(rightopaque))
 			{
-				uargs->current_blkno = right_opaque->btpo_next;
-				UnlockReleaseBuffer(right_buf);
-				UnlockReleaseBuffer(left_buf);
+				uargs->current_blkno = rightopaque->btpo_next;
+				UnlockReleaseBuffer(rightbuf);
+				UnlockReleaseBuffer(leftbuf);
 				continue;
 			}
 
-			Assert(P_ISLEAF(right_opaque));
+			Assert(P_ISLEAF(rightopaque));
 
 			scankey = NULL;
 			{
-				OffsetNumber first_data_off = P_FIRSTDATAKEY(left_opaque);
+				OffsetNumber first_data_off = P_FIRSTDATAKEY(leftopaque);
 
-				if (first_data_off <= PageGetMaxOffsetNumber(left_page))
+				if (first_data_off <= PageGetMaxOffsetNumber(leftpage))
 				{
-					IndexTuple	first_itup = (IndexTuple) PageGetItem(left_page,
-																	  PageGetItemId(left_page, first_data_off));
+					IndexTuple	first_itup = (IndexTuple) PageGetItem(leftpage,
+																	  PageGetItemId(leftpage, first_data_off));
 
 					scankey = _bt_mkscankey(rel, first_itup);
 				}
@@ -1181,8 +1181,8 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 			/* L is examined; slide the window to R as the default next-left. */
 			uargs->current_blkno = right_blkno;
 
-			UnlockReleaseBuffer(right_buf);
-			UnlockReleaseBuffer(left_buf);
+			UnlockReleaseBuffer(rightbuf);
+			UnlockReleaseBuffer(leftbuf);
 
 			left_used = BLCKSZ - left_free;
 			right_used = BLCKSZ - right_free;
@@ -1296,9 +1296,9 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		Relation	rel;
 		List	   *relname_list;
 		RangeVar   *relrv;
-		Buffer		left_buf;
-		Page		left_page;
-		BTPageOpaque left_opaque;
+		Buffer		leftbuf;
+		Page		leftpage;
+		BTPageOpaque leftopaque;
 		OffsetNumber first_data_off;
 		IndexTuple	first_itup;
 		BTScanInsert scankey;
@@ -1333,26 +1333,26 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		 * data tuple, which we will use to build the scan key for the
 		 * descent.
 		 */
-		left_buf = ReadBuffer(rel, left_blkno);
-		LockBuffer(left_buf, BUFFER_LOCK_SHARE);
-		left_page = BufferGetPage(left_buf);
-		left_opaque = BTPageGetOpaque(left_page);
+		leftbuf = ReadBuffer(rel, left_blkno);
+		LockBuffer(leftbuf, BUFFER_LOCK_SHARE);
+		leftpage = BufferGetPage(leftbuf);
+		leftopaque = BTPageGetOpaque(leftpage);
 
-		if (!P_ISLEAF(left_opaque))
+		if (!P_ISLEAF(leftopaque))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							errmsg("block %u is not a leaf page", left_blkno)));
 
-		if (P_ISDELETED(left_opaque) || P_ISHALFDEAD(left_opaque))
+		if (P_ISDELETED(leftopaque) || P_ISHALFDEAD(leftopaque))
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("block %u is a deleted or half-dead page and cannot be inspected for merge", left_blkno)));
 
-		if (P_ISMERGEDAWAY(left_opaque))
+		if (P_ISMERGEDAWAY(leftopaque))
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("block %u is a merged-away tombstone and cannot be inspected for merge", left_blkno)));
 
-		right_blkno = left_opaque->btpo_next;
+		right_blkno = leftopaque->btpo_next;
 
-		if (P_RIGHTMOST(left_opaque))
+		if (P_RIGHTMOST(leftopaque))
 			ereport(
 					ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1363,14 +1363,14 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		 * P_FIRSTDATAKEY returns the offset of the first real data tuple,
 		 * skipping the high-key slot on non-leftmost pages.
 		 */
-		first_data_off = P_FIRSTDATAKEY(left_opaque);
-		if (first_data_off > PageGetMaxOffsetNumber(left_page))
+		first_data_off = P_FIRSTDATAKEY(leftopaque);
+		if (first_data_off > PageGetMaxOffsetNumber(leftpage))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 							errmsg("leaf page %u is empty cannot determine parent",
 								   left_blkno)));
 
 		first_itup = (IndexTuple) PageGetItem(
-											  left_page, PageGetItemId(left_page, first_data_off));
+											  leftpage, PageGetItemId(leftpage, first_data_off));
 
 		/*
 		 * Build a typed scan key from the tuple using the relation schema.
@@ -1379,7 +1379,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		 */
 		scankey = _bt_mkscankey(rel, first_itup);
 
-		UnlockReleaseBuffer(left_buf);	/* release left before the descent */
+		UnlockReleaseBuffer(leftbuf);	/* release left before the descent */
 
 		/*
 		 * Step 2: Descend from the root in O(log N) reads. _bt_search
@@ -1414,16 +1414,16 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		 * parent update.
 		 */
 		{
-			Buffer		parent_buf;
-			Page		parent_page;
+			Buffer		parentbuf;
+			Page		parentpage;
 			OffsetNumber off,
 						maxoff;
 			bool		found_right = false;
 
-			parent_buf = ReadBuffer(rel, parent_blkno);
-			LockBuffer(parent_buf, BUFFER_LOCK_SHARE);
-			parent_page = BufferGetPage(parent_buf);
-			maxoff = PageGetMaxOffsetNumber(parent_page);
+			parentbuf = ReadBuffer(rel, parent_blkno);
+			LockBuffer(parentbuf, BUFFER_LOCK_SHARE);
+			parentpage = BufferGetPage(parentbuf);
+			maxoff = PageGetMaxOffsetNumber(parentpage);
 
 			/*
 			 * For non-rightmost pages, offset 1 is the HIGH KEY — its t_tid
@@ -1432,7 +1432,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 			 * downlinks.
 			 */
 			{
-				BTPageOpaque pOpaque = BTPageGetOpaque(parent_page);
+				BTPageOpaque pOpaque = BTPageGetOpaque(parentpage);
 				OffsetNumber scan_start = P_RIGHTMOST(pOpaque)
 					? FirstOffsetNumber
 					: OffsetNumberNext(P_HIKEY);
@@ -1440,7 +1440,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 				for (off = scan_start; off <= maxoff; off++)
 				{
 					IndexTuple	itup = (IndexTuple) PageGetItem(
-																parent_page, PageGetItemId(parent_page, off));
+																parentpage, PageGetItemId(parentpage, off));
 
 					if (ItemPointerGetBlockNumberNoCheck(&itup->t_tid) == right_blkno)
 					{
@@ -1450,7 +1450,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 				}
 			}
 
-			UnlockReleaseBuffer(parent_buf);
+			UnlockReleaseBuffer(parentbuf);
 
 			if (!found_right)
 			{
