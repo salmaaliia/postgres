@@ -96,7 +96,8 @@ CommitTs
 ReplicationOrigin
 Generic
 LogicalMessage
-XLOG2$/,
+XLOG2
+Btree2$/,
 	'rmgr list');
 
 
