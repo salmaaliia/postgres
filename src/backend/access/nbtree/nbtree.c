@@ -1682,18 +1682,17 @@ backtrack:
 
 				if(RelationNeedsWAL(rel))
 				{
-					xl_btree_merge xlrec = {0};
-					xlrec.action = XLOG_BTREE_CLEAR_MERGE_FLAG;
+					xl_btree_clear_m xlrec;
 					xlrec.safemergexid = safemergexid;
 					xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
 
 					XLogBeginInsert();
 
-					XLogRegisterData(&xlrec, SizeOfBtreeMerge);
+					XLogRegisterData(&xlrec, SizeOfBtreeClearM);
 
 					XLogRegisterBuffer(0, bwd_buf, REGBUF_STANDARD);
 
-					recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MERGE);
+					recptr = XLogInsert(RM_BTREE2_ID, XLOG_BTREE2_CLEAR_MERGE_FLAG);
 				}
 				else
 					recptr = XLogGetFakeLSN(rel);
@@ -1756,8 +1755,7 @@ backtrack:
 
 			if(RelationNeedsWAL(rel))
 			{
-				xl_btree_merge xlrec = {0};
-				xlrec.action = XLOG_BTREE_MERGE_MARK_HALFDEAD;
+				xl_btree_mark_ma_hd xlrec;
 				xlrec.left_prev = opaque->btpo_prev;
 				xlrec.left_next = opaque->btpo_next;
 				xlrec.safemergexid = safemergexid;
@@ -1765,11 +1763,11 @@ backtrack:
 
 				XLogBeginInsert();
 
-				XLogRegisterData(&xlrec, SizeOfBtreeMerge);
+				XLogRegisterData(&xlrec, SizeOfBtreeMarkMaHd);
 
 				XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
 
-				recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MERGE);
+				recptr = XLogInsert(RM_BTREE2_ID, XLOG_BTREE2_MERGE_MARK_HALFDEAD);
 			}
 			else
 				recptr = XLogGetFakeLSN(rel);

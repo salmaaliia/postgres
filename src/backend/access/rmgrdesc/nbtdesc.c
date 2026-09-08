@@ -132,36 +132,42 @@ btree_desc(StringInfo buf, XLogReaderState *record)
 								 xlrec->last_cleanup_num_delpages);
 				break;
 			}
-		case XLOG_BTREE_MERGE:
-		    {
-		        xl_btree_merge *xlrec = (xl_btree_merge *) rec;
-			
-		        switch (xlrec->action)
-		        {
-		            case XLOG_BTREE_MERGE_PAGES:
-		                appendStringInfo(buf,
-		                    "merge pages: left_prev: %u, left_next: %u, "
-		                    "poffset: %u, safexid: %u:%u",
-		                    xlrec->left_prev, xlrec->left_next,
-		                    xlrec->poffset,
-		                    EpochFromFullTransactionId(xlrec->safemergexid),
-		                    XidFromFullTransactionId(xlrec->safemergexid));
-		                break;
-		            case XLOG_BTREE_CLEAR_MERGE_FLAG:
-		                appendStringInfoString(buf, "clear merge flag");
-		                break;
-		            case XLOG_BTREE_MERGE_MARK_HALFDEAD:
-		                appendStringInfo(buf,
-		                    "mark merged-away page half-dead: left: %u, right: %u",
-		                    xlrec->left_prev, xlrec->left_next);
-		                break;
-		            default:
-		                appendStringInfo(buf, "unknown action %u", xlrec->action);
-		                break;
-		        }
-		        break;
-		    }
 
+	}
+}
+
+void
+btree2_desc(StringInfo buf, XLogReaderState *record)
+{
+	char	   *rec = XLogRecGetData(record);
+	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+
+	switch (info)
+	{
+		case XLOG_BTREE2_MERGE:
+		{
+			xl_btree_merge *xlrec = (xl_btree_merge *) rec;
+			appendStringInfo(buf,
+		        "merge pages: left_prev: %u, left_next: %u, "
+		        "poffset: %u, safexid: %u:%u",
+		        xlrec->left_prev, xlrec->left_next,
+		        xlrec->poffset,
+		        EpochFromFullTransactionId(xlrec->safemergexid),
+		        XidFromFullTransactionId(xlrec->safemergexid));
+		    break;
+		}
+		case XLOG_BTREE2_CLEAR_MERGE_FLAG:
+		{	appendStringInfoString(buf, "clear merge flag");
+		    break;
+		}
+		case XLOG_BTREE2_MERGE_MARK_HALFDEAD:
+		{
+			xl_btree_mark_ma_hd *xlrec = (xl_btree_mark_ma_hd *) rec;
+			appendStringInfo(buf,
+		        "mark merged-away page half-dead: left: %u, right: %u",
+		        xlrec->left_prev, xlrec->left_next);
+		    break;
+		}
 	}
 }
 
@@ -217,10 +223,27 @@ btree_identify(uint8 info)
 		case XLOG_BTREE_META_CLEANUP:
 			id = "META_CLEANUP";
 			break;
-		case XLOG_BTREE_MERGE:
-			id = "MERGE";
 	}
 
+	return id;
+}
+
+const char *
+btree2_identify(uint8 info){
+	const char *id = NULL;
+
+	switch (info & ~XLR_INFO_MASK)
+	{
+		case XLOG_BTREE2_MERGE:
+			id = "MERGE";
+			break;
+		case XLOG_BTREE2_CLEAR_MERGE_FLAG:
+			id = "CLEAR_MERGED_FLAG";
+			break;
+		case XLOG_BTREE2_MERGE_MARK_HALFDEAD:
+			id = "MARK_MA_AS_HD";
+			break;
+	}
 	return id;
 }
 

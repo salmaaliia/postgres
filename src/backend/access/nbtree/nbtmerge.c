@@ -473,13 +473,12 @@ _bt_mergepage(BTMergeState mstate)
 
 	if(RelationNeedsWAL(rel))
 	{
-		xl_btree_merge xlrec = {0};
+		xl_btree_merge xlrec;
 
 		xlrec.left_prev = leftopaque->btpo_prev;
 		xlrec.left_next = mstate.right_blkno;
 		xlrec.poffset = stack->bts_offset;
 		xlrec.safemergexid = safemergexid;
-		xlrec.action = XLOG_BTREE_MERGE_PAGES;
 
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, SizeOfBtreeMerge);
@@ -488,7 +487,7 @@ _bt_mergepage(BTMergeState mstate)
 		XLogRegisterBuffer(1, rightbuf, REGBUF_FORCE_IMAGE | REGBUF_STANDARD);
 		XLogRegisterBuffer(2, parentbuf, REGBUF_STANDARD);
 
-		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MERGE);
+		recptr = XLogInsert(RM_BTREE2_ID, XLOG_BTREE2_MERGE);
 	}
 	else
 		recptr = XLogGetFakeLSN(rel);

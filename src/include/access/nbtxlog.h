@@ -42,7 +42,17 @@
 										 * FSM */
 #define XLOG_BTREE_META_CLEANUP	0xE0	/* update cleanup-related data in the
 										 * metapage */
-#define XLOG_BTREE_MERGE		0xF0
+
+
+
+/*
+ * We ran out of opcodes, so btree now has a second RmgrId.  These opcodes
+ * are associated with RM_BTREE2_ID.
+ */
+#define XLOG_BTREE2_MERGE					0x00
+#define XLOG_BTREE2_CLEAR_MERGE_FLAG			0x10	
+#define XLOG_BTREE2_MERGE_MARK_HALFDEAD		0x20
+
 /*
  * All that we need to regenerate the meta-data page
  */
@@ -351,25 +361,32 @@ typedef struct xl_btree_newroot
 #define SizeOfBtreeNewroot	(offsetof(xl_btree_newroot, level) + sizeof(uint32))
 
 
-typedef enum xl_btree_merge_action
-{
-	XLOG_BTREE_MERGE_PAGES,
-	XLOG_BTREE_CLEAR_MERGE_FLAG,
-	XLOG_BTREE_MERGE_MARK_HALFDEAD
-} xl_btree_merge_action;
-
 typedef struct xl_btree_merge
 {
-	uint8		 action;
 	BlockNumber  left_prev;      /* L's left sibling (for btpo_prev of MA page) */
 	BlockNumber  left_next;      /* L's right sibling (for btpo_prev of MA page) */ 
-	OffsetNumber poffset;	/* offset of L's downlink in parent */
-	bool		isCatalogRel;	/* to handle recovery conflict during logical
-							* decoding on standby */
+	OffsetNumber poffset;		/* offset of L's downlink in parent */
 	FullTransactionId safemergexid;
 } xl_btree_merge;
-/* TODO: need to decide on the size */
 #define SizeOfBtreeMerge	(offsetof(xl_btree_merge, safemergexid) + sizeof(uint64))
+
+typedef struct xl_btree_clear_m
+{
+	bool		isCatalogRel;	/* to handle recovery conflict during logical
+								* decoding on standby */
+	FullTransactionId safemergexid;
+} xl_btree_clear_m;
+#define SizeOfBtreeClearM 	(offsetof(xl_btree_clear_m, safemergexid) + sizeof(uint64))
+
+typedef struct xl_btree_mark_ma_hd
+{
+	BlockNumber  left_prev;      /* L's left sibling (for btpo_prev of MA page) */
+	BlockNumber  left_next;      /* L's right sibling (for btpo_prev of MA page) */ 
+	bool		isCatalogRel;	/* to handle recovery conflict during logical
+								 * decoding on standby */
+	FullTransactionId safemergexid;
+} xl_btree_mark_ma_hd;
+#define SizeOfBtreeMarkMaHd 	(offsetof(xl_btree_mark_ma_hd, safemergexid) + sizeof(uint64))
 
 /*
  * prototypes for functions in nbtxlog.c
@@ -378,11 +395,14 @@ extern void btree_redo(XLogReaderState *record);
 extern void btree_xlog_startup(void);
 extern void btree_xlog_cleanup(void);
 extern void btree_mask(char *pagedata, BlockNumber blkno);
+extern void btree2_redo(XLogReaderState *record);
 
 /*
  * prototypes for functions in nbtdesc.c
  */
 extern void btree_desc(StringInfo buf, XLogReaderState *record);
 extern const char *btree_identify(uint8 info);
+extern void btree2_desc(StringInfo buf, XLogReaderState *record);
+extern const char *btree2_identify(uint8 info);
 
 #endif							/* NBTXLOG_H */
