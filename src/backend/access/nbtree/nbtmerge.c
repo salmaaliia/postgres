@@ -473,7 +473,7 @@ _bt_mergepage(BTMergeState mstate)
 
 	if(RelationNeedsWAL(rel))
 	{
-		xl_btree_merge xlrec;
+		xl_btree_merge xlrec = {0};
 
 		xlrec.left_prev = leftopaque->btpo_prev;
 		xlrec.left_next = mstate.right_blkno;

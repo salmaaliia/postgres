@@ -258,6 +258,7 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 	BlockNumber origpagenumber;
 	BlockNumber rightpagenumber;
 	BlockNumber spagenumber;
+	BlockNumber	merge_ma_blkno = xlrec->merged_ma_blkno;
 
 	XLogRecGetBlockTag(record, 0, NULL, NULL, &origpagenumber);
 	XLogRecGetBlockTag(record, 1, NULL, NULL, &rightpagenumber);
@@ -293,6 +294,11 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 	ropaque->btpo_level = xlrec->level;
 	ropaque->btpo_flags = isleaf ? BTP_LEAF : 0;
 	ropaque->btpo_cycleid = 0;
+
+	if(merge_ma_blkno != InvalidBlockNumber){
+		ropaque->btpo_flags |= BTP_MERGED;
+		BTMergedPageSetMABlkno(rpage, merge_ma_blkno);
+	}
 
 	_bt_restore_page(rpage, datapos, datalen);
 
@@ -415,6 +421,12 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 		oopaque->btpo_flags = BTP_INCOMPLETE_SPLIT;
 		if (isleaf)
 			oopaque->btpo_flags |= BTP_LEAF;
+
+		if(merge_ma_blkno != InvalidBlockNumber){
+			oopaque->btpo_flags |= BTP_MERGED;
+			BTMergedPageSetMABlkno(origpage, merge_ma_blkno);
+		}
+
 		oopaque->btpo_next = rightpagenumber;
 		oopaque->btpo_cycleid = 0;
 
@@ -486,6 +498,13 @@ btree_xlog_dedup(XLogReaderState *record)
 		minoff = P_FIRSTDATAKEY(opaque);
 		maxoff = PageGetMaxOffsetNumber(page);
 		newpage = PageGetTempPageCopySpecial(page);
+
+		if (xlrec->merged_ma_blkno != InvalidBlockNumber)
+		{
+			BTPageOpaque nopaque = BTPageGetOpaque(newpage);
+			nopaque->btpo_flags |= BTP_MERGED;
+			BTMergedPageSetMABlkno(newpage, xlrec->merged_ma_blkno);
+		}
 
 		if (!P_RIGHTMOST(opaque))
 		{
@@ -1008,7 +1027,24 @@ btree_xlog_merge_page(XLogReaderState *record)
 	Buffer		buf;
 	Page		page;
 	BTPageOpaque pageop;
+
+	/*
+	 * If we have any conflict processing to do, it must happen before we
+	 * update the page
+	 */
+	if (InHotStandby &&
+		(xlrec->action == XLOG_BTREE_CLEAR_MERGE_FLAG ||
+		 xlrec->action == XLOG_BTREE_MERGE_MARK_HALFDEAD))
+	{
+		RelFileLocator rlocator;
 	
+		XLogRecGetBlockTag(record, 0, &rlocator, NULL, NULL);
+	
+		ResolveRecoveryConflictWithSnapshotFullXid(
+			xlrec->safemergexid,
+			xlrec->isCatalogRel,
+			rlocator);
+	}
 
 	if(xlrec->action == XLOG_BTREE_MERGE_PAGES){
 		/* parent page */
@@ -1200,13 +1236,19 @@ btree_mask(char *pagedata, BlockNumber blkno)
 {
 	Page		page = (Page) pagedata;
 	BTPageOpaque maskopaq;
+	PageHeader	phdr = (PageHeader) page;
+	TransactionId saved_prune_xid;
+
+	saved_prune_xid = phdr->pd_prune_xid;
 
 	mask_page_lsn_and_checksum(page);
-
 	mask_page_hint_bits(page);
 	mask_unused_space(page);
 
 	maskopaq = BTPageGetOpaque(page);
+
+	if(P_ISMERGED(maskopaq))
+		phdr->pd_prune_xid = saved_prune_xid;
 
 	if (P_ISLEAF(maskopaq))
 	{

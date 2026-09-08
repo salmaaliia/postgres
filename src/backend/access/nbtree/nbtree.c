@@ -1684,6 +1684,8 @@ backtrack:
 				{
 					xl_btree_merge xlrec = {0};
 					xlrec.action = XLOG_BTREE_CLEAR_MERGE_FLAG;
+					xlrec.safemergexid = safemergexid;
+					xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
 
 					XLogBeginInsert();
 
@@ -1758,6 +1760,8 @@ backtrack:
 				xlrec.action = XLOG_BTREE_MERGE_MARK_HALFDEAD;
 				xlrec.left_prev = opaque->btpo_prev;
 				xlrec.left_next = opaque->btpo_next;
+				xlrec.safemergexid = safemergexid;
+				xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
 
 				XLogBeginInsert();
 

@@ -156,9 +156,10 @@ typedef struct xl_btree_split
 	OffsetNumber firstrightoff; /* first origpage item on rightpage */
 	OffsetNumber newitemoff;	/* new item's offset */
 	uint16		postingoff;		/* offset inside orig posting tuple */
+	BlockNumber merged_ma_blkno;
 } xl_btree_split;
 
-#define SizeOfBtreeSplit	(offsetof(xl_btree_split, postingoff) + sizeof(uint16))
+#define SizeOfBtreeSplit	(offsetof(xl_btree_split, merged_ma_blkno) + sizeof(BlockNumber))
 
 /*
  * When page is deduplicated, consecutive groups of tuples with equal keys are
@@ -170,11 +171,11 @@ typedef struct xl_btree_split
 typedef struct xl_btree_dedup
 {
 	uint16		nintervals;
-
+	BlockNumber merged_ma_blkno;
 	/* DEDUPLICATION INTERVALS FOLLOW */
 } xl_btree_dedup;
 
-#define SizeOfBtreeDedup 	(offsetof(xl_btree_dedup, nintervals) + sizeof(uint16))
+#define SizeOfBtreeDedup 	(offsetof(xl_btree_dedup, merged_ma_blkno) + sizeof(BlockNumber))
 
 /*
  * This is what we need to know about page reuse within btree.  This record
@@ -363,6 +364,8 @@ typedef struct xl_btree_merge
 	BlockNumber  left_prev;      /* L's left sibling (for btpo_prev of MA page) */
 	BlockNumber  left_next;      /* L's right sibling (for btpo_prev of MA page) */ 
 	OffsetNumber poffset;	/* offset of L's downlink in parent */
+	bool		isCatalogRel;	/* to handle recovery conflict during logical
+							* decoding on standby */
 	FullTransactionId safemergexid;
 } xl_btree_merge;
 /* TODO: need to decide on the size */
