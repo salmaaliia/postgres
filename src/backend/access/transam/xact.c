@@ -1489,6 +1489,8 @@ RecordTransactionCommit(void)
 							MyXactFlags,
 							InvalidTransactionId, NULL /* plain commit */ );
 
+		XactLastCommitStart = ProcLastRecPtr;
+
 		if (replorigin)
 			/* Move LSNs forward for this replication origin */
 			replorigin_session_advance(replorigin_xact_state.origin_lsn,
@@ -2174,6 +2176,7 @@ StartTransaction(void)
 	XactIsoLevel = DefaultXactIsoLevel;
 	forceSyncCommit = false;
 	MyXactFlags = 0;
+	XactLastCommitStart = InvalidXLogRecPtr;
 
 	/*
 	 * reinitialize within-transaction counters
