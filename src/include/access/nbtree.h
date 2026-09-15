@@ -83,6 +83,9 @@ typedef BTPageOpaqueData *BTPageOpaque;
 #define BTP_HAS_GARBAGE (1 << 6)	/* page has LP_DEAD tuples (deprecated) */
 #define BTP_INCOMPLETE_SPLIT (1 << 7)	/* right sibling's downlink is missing */
 #define BTP_HAS_FULLXID	(1 << 8)	/* contains BTDeletedPageData */
+#define BTP_MERGED		(1 << 9)	/* This node contain its lift sibling data */
+#define BTP_MERGED_AWAY	(1 << 10)	/* This node was merged into its right
+									 * sibling */
 
 /*
  * The max allowed value of a cycle ID is a bit less than 64K.  This is
@@ -227,6 +230,103 @@ typedef struct BTMetaPageData
 #define P_HAS_GARBAGE(opaque)	(((opaque)->btpo_flags & BTP_HAS_GARBAGE) != 0)
 #define P_INCOMPLETE_SPLIT(opaque)	(((opaque)->btpo_flags & BTP_INCOMPLETE_SPLIT) != 0)
 #define P_HAS_FULLXID(opaque)	(((opaque)->btpo_flags & BTP_HAS_FULLXID) != 0)
+#define P_ISMERGED(opaque)		(((opaque)->btpo_flags & BTP_MERGED) != 0)
+#define P_ISMERGEDAWAY(opaque)	(((opaque)->btpo_flags & BTP_MERGED_AWAY) != 0)
+
+/*
+ * Accessors for the MERGED_AWAY block number stored on BTP_MERGED pages.
+ *
+ * We store the block number of the corresponding BTP_MERGED_AWAY (tombstone)
+ * page in pd_prune_xid, which is a 4-byte field in PageHeaderData that is
+ * explicitly documented as "currently unused in index pages" (see bufpage.h).
+ * This is the only available 4-byte slot on a MERGED page that may be
+ * completely full of index tuples -- we cannot extend the special area on
+ * a full page, and the item content area is occupied by live tuples.
+ *
+ * Only valid when P_MERGED(opaque) is true.  All other B-tree pages keep
+ * pd_prune_xid at its default value of InvalidTransactionId (0).
+ */
+#define BTMergedPageGetMABlkno(page) \
+	((BlockNumber) ((PageHeader)(page))->pd_prune_xid)
+
+#define BTMergedPageSetMABlkno(page, blkno) \
+	(((PageHeader)(page))->pd_prune_xid = (TransactionId)(blkno))
+
+/*
+ * Clear the MA block number from a MERGED page when the BTP_MERGED flag is
+ * being cleared (e.g., during vacuum cleanup of the merge group).
+ * Restores pd_prune_xid to its standard value of InvalidTransactionId (0),
+ * since index pages normally never use that field.
+ */
+#define BTMergedPageClearMABlkno(page) \
+	(((PageHeader)(page))->pd_prune_xid = InvalidTransactionId)
+
+
+typedef struct BTMergedAwayPageData
+{
+	FullTransactionId safemergexid;
+}			BTMergedAwayPageData;
+
+static inline void
+BTPageSetMerged(Page page)
+{
+	BTPageOpaque opaque;
+
+	opaque = BTPageGetOpaque(page);
+	opaque->btpo_flags |= BTP_MERGED;
+
+}
+
+static inline void
+BTPageSetMergedAway(Page page, FullTransactionId safemergexid)
+{
+	BTPageOpaque opaque;
+	PageHeader	header;
+	BTMergedAwayPageData *contents;
+
+	opaque = BTPageGetOpaque(page);
+	header = ((PageHeader) page);
+
+	opaque->btpo_flags |= BTP_MERGED_AWAY | BTP_HAS_FULLXID;
+	header->pd_lower = MAXALIGN(SizeOfPageHeaderData) +
+		sizeof(BTMergedAwayPageData);
+	header->pd_upper = header->pd_special;
+
+	contents = (BTMergedAwayPageData *) PageGetContents(page);
+	contents->safemergexid = safemergexid;
+}
+
+static inline FullTransactionId
+BTMergedAwayGetSafeXid(Page page)
+{
+	BTPageOpaque opaque;
+	BTMergedAwayPageData *contents;
+
+	opaque = BTPageGetOpaque(page);
+	Assert(P_ISMERGEDAWAY(opaque));
+
+	if (!P_HAS_FULLXID(opaque))
+		return FirstNormalFullTransactionId;
+
+	contents = (BTMergedAwayPageData *) PageGetContents(page);
+	return contents->safemergexid;
+}
+
+/*
+ * BTPageIsMergedMember -- true when a page is a valid member of the merge
+ * group whose tombstone (MA page) is at ma_blkno.
+ *
+ * Used during VACUUM cleanup to validate each M page before clearing its
+ * flags, preventing accidental absorption of pages from an adjacent group.
+ */
+static inline bool
+BTPageIsMergedMember(BTPageOpaque opq, Page pg, BlockNumber ma_blkno)
+{
+	return P_ISMERGED(opq) &&
+		P_ISLEAF(opq) &&
+		!P_ISMERGEDAWAY(opq) &&
+		BTMergedPageGetMABlkno(pg) == ma_blkno;
+}
 
 /*
  * BTDeletedPageData is the page contents of a deleted page
@@ -1092,6 +1192,15 @@ typedef struct BTScanOpaqueData
 	/* keep these last in struct for efficiency */
 	BTScanPosData currPos;		/* current position data */
 	BTScanPosData markPos;		/* marked position, if any */
+
+	/* Merge information */
+	bool		skipMergeRecovery;
+	bool		needMergeRecovery;
+
+	ItemPointerData savedMergeTids[MaxTIDsPerBTreePage];
+	int			nSavedMergeTids;	/* number of TIDs in the array */
+	BlockNumber mergedAwayBlkno;	/* blkno of L (BTP_MERGED_AWAY page) */
+
 } BTScanOpaqueData;
 
 typedef BTScanOpaqueData *BTScanOpaque;
@@ -1219,6 +1328,7 @@ extern void _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf,
 							 BTStack stack);
 extern Buffer _bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack,
 							  BlockNumber child);
+extern void _bt_freestack(BTStack stack);
 
 /*
  * prototypes for functions in nbtsplitloc.c
@@ -1262,6 +1372,8 @@ extern void _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate);
 extern void _bt_pendingfsm_init(Relation rel, BTVacState *vstate,
 								bool cleanuponly);
 extern void _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate);
+extern bool _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
+								   BlockNumber right_blkno, BTScanInsert scankey, BTStack *stack_out);
 
 /*
  * prototypes for functions in nbtpreprocesskeys.c
@@ -1330,5 +1442,12 @@ extern void btadjustmembers(Oid opfamilyoid,
 extern IndexBuildResult *btbuild(Relation heap, Relation index,
 								 struct IndexInfo *indexInfo);
 extern void _bt_parallel_build_main(dsm_segment *seg, shm_toc *toc);
+
+/**
+ * prototypes for functions in nbmerge.c
+ */
+
+extern int32 _bt_merge_index(Relation rel, float8 min_pct, float8 dest_pct, int32 num_pages);
+
 
 #endif							/* NBTREE_H */

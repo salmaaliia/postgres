@@ -119,6 +119,8 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 	 */
 	newpage = PageGetTempPageCopySpecial(page);
 	PageSetLSN(newpage, PageGetLSN(page));
+	if (P_ISMERGED(opaque))
+		BTMergedPageSetMABlkno(newpage, BTMergedPageGetMABlkno(page));
 
 	/* Copy high key, if any */
 	if (!P_RIGHTMOST(opaque))
@@ -246,9 +248,11 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 	/* XLOG stuff */
 	if (RelationNeedsWAL(rel))
 	{
-		xl_btree_dedup xlrec_dedup;
+		xl_btree_dedup xlrec_dedup = {0};
 
 		xlrec_dedup.nintervals = state->nintervals;
+
+		xlrec_dedup.merged_ma_blkno = P_ISMERGED(opaque)? BTMergedPageGetMABlkno(page): InvalidBlockNumber;
 
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
