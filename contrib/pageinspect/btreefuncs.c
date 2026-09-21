@@ -41,6 +41,9 @@
 #include "storage/bufmgr.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "lib/stringinfo.h"
+#include "utils/pg_lsn.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/varlena.h"
 
@@ -54,6 +57,8 @@ PG_FUNCTION_INFO_V1(bt_multi_page_stats);
 PG_FUNCTION_INFO_V1(bt_find_merge_candidates);
 PG_FUNCTION_INFO_V1(bt_merge_detail);
 PG_FUNCTION_INFO_V1(bt_merge);
+PG_FUNCTION_INFO_V1(bt_page_header);                                                         
+PG_FUNCTION_INFO_V1(bt_leaf_page_items_detailed);
 
 #define IS_INDEX(r) ((r)->rd_rel->relkind == RELKIND_INDEX)
 #define IS_BTREE(r) ((r)->rd_rel->relam == BTREE_AM_OID)
@@ -1722,4 +1727,371 @@ bt_merge(PG_FUNCTION_ARGS)
 
 	PG_RETURN_INT32(merges_performed);
 
+}
+
+
+Datum
+bt_page_header(PG_FUNCTION_ARGS)
+{
+	text	   		*relname = PG_GETARG_TEXT_PP(0);
+	int64			blkno	= PG_GETARG_INT64(1);
+	RangeVar	   *relrv;
+	Relation		rel;
+	Buffer			buf;
+	Page			page;
+	PageHeader		phdr;
+	BTPageOpaque	opaque;
+	TupleDesc		tupleDesc;
+	Datum			result;
+	HeapTuple		tuple;
+	char 			*values[14];
+	int j;
+	StringInfoData opaque_buf;
+	char *opaque_flags;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to use pageinspect functions")));
+
+	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
+	rel = relation_openrv(relrv, AccessShareLock);
+
+	if (!IS_INDEX(rel) || !IS_BTREE(rel))
+		ereport(ERROR,
+				(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+				 errmsg("\"%s\" is not a %s index",
+						RelationGetRelationName(rel), "btree")));
+
+	buf = ReadBuffer(rel, blkno);
+	LockBuffer(buf, BUFFER_LOCK_SHARE);
+	page = BufferGetPage(buf);
+	phdr = ((PageHeader) page);
+	opaque = BTPageGetOpaque(page);
+
+	// if (!P_ISLEAF(opaque))
+	// 	ereport(ERROR,
+	// 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+	// 			 errmsg("block " INT64_FORMAT " is not a leaf page (level=%u)", blkno, opaque->btpo_level)));
+
+	if(get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	initStringInfo(&opaque_buf);
+
+	if (opaque->btpo_flags & BTP_LEAF)
+        appendStringInfoString(&opaque_buf, "LEAF|");
+    if (opaque->btpo_flags & BTP_ROOT)
+        appendStringInfoString(&opaque_buf, "ROOT|");
+    if (opaque->btpo_flags & BTP_DELETED)
+        appendStringInfoString(&opaque_buf, "DELETED|");
+    if (opaque->btpo_flags & BTP_META)
+        appendStringInfoString(&opaque_buf, "META|");
+    if (opaque->btpo_flags & BTP_HALF_DEAD)
+        appendStringInfoString(&opaque_buf, "HALF_DEAD|");
+    if (opaque->btpo_flags & BTP_SPLIT_END)
+        appendStringInfoString(&opaque_buf, "SPLIT_END|");
+    if (opaque->btpo_flags & BTP_HAS_GARBAGE)
+        appendStringInfoString(&opaque_buf, "HAS_GARBAGE|");
+    if (opaque->btpo_flags & BTP_INCOMPLETE_SPLIT)
+        appendStringInfoString(&opaque_buf, "INCOMPLETE_SPLIT|");
+    if (opaque->btpo_flags & BTP_HAS_FULLXID)
+        appendStringInfoString(&opaque_buf, "HAS_FULLXID|");
+    
+    if (opaque->btpo_flags & BTP_MERGED)
+        appendStringInfoString(&opaque_buf, "MERGED|");
+    if (opaque->btpo_flags & BTP_MERGED_AWAY)
+        appendStringInfoString(&opaque_buf, "MERGED_AWAY|");
+
+    if (opaque_buf.len == 0)
+        appendStringInfoString(&opaque_buf, "NONE");
+    else if (opaque_buf.data[opaque_buf.len - 1] == '|')
+        opaque_buf.data[opaque_buf.len - 1] = '\0';
+
+    opaque_flags = opaque_buf.data;
+
+
+	j = 0;
+	values[j++] = psprintf(INT64_FORMAT, blkno);
+	values[j++] = psprintf("%X/%X", LSN_FORMAT_ARGS(PageGetLSN(page)));
+	values[j++] = psprintf("%u", phdr->pd_checksum);
+	values[j++] = psprintf("%u", phdr->pd_lower);
+	values[j++] = psprintf("%u", phdr->pd_upper);
+	values[j++] = psprintf("%u", phdr->pd_special);
+	values[j++] = psprintf("%u", phdr->pd_upper - phdr->pd_lower);
+	values[j++] = psprintf("%u", opaque->btpo_level);
+	values[j++] = (opaque->btpo_prev == P_NONE) ? NULL : psprintf(INT64_FORMAT, (int64) opaque->btpo_prev);                                                                                        
+    values[j++] = (opaque->btpo_next == P_NONE) ? NULL : psprintf(INT64_FORMAT, (int64) opaque->btpo_next); 
+	values[j++] = opaque_flags;
+	values[j++] = (phdr->pd_prune_xid == 0) ? NULL : psprintf(INT64_FORMAT, (int64) BTMergedPageGetMABlkno(page));
+	values[j++] = psprintf("%u", (unsigned int) PageGetMaxOffsetNumber(page));
+    values[j++] = psprintf("%.2f", ((double) (phdr->pd_upper - phdr->pd_lower) / BLCKSZ) * 100.0);
+
+
+	UnlockReleaseBuffer(buf);
+	relation_close(rel, AccessShareLock);
+
+	tuple = BuildTupleFromCStrings(TupleDescGetAttInMetadata(tupleDesc),
+								   values);
+
+	result = HeapTupleGetDatum(tuple);
+
+	PG_RETURN_DATUM(result);
+}
+
+
+/*
+ * Cross-call data structure for the SRF bt_leaf_page_items_detailed.
+ * Preserves state between each tuple row returned to the caller.
+ */
+typedef struct ua_leaf_page_items
+{
+	Page		page;			/* Local snapshot of the 8KB leaf page */
+	OffsetNumber offset;		/* Current line pointer offset: 1..maxoff */
+	bool		rightmost;		/* Is this the rightmost leaf page? (P_RIGHTMOST) */
+	TupleDesc	result_tupd;	/* Descriptor for the 15-column SRF output row */
+	TupleDesc	index_tupd;		/* Descriptor of the index relation (for index_deform_tuple) */
+} ua_leaf_page_items;
+
+
+Datum
+bt_leaf_page_items_detailed(PG_FUNCTION_ARGS)
+{
+	FuncCallContext   *fctx;
+	ua_leaf_page_items *uargs;
+	
+	if (SRF_IS_FIRSTCALL())
+	{
+		text	   *relname = PG_GETARG_TEXT_PP(0);
+		int64		blkno	= PG_GETARG_INT64(1);
+		int32		tuple_count = PG_GETARG_INT32(2);
+		RangeVar   *relrv;
+		Relation	rel;
+		Buffer		buf;
+		BTPageOpaque opaque;
+		TupleDesc	tupleDesc;
+		MemoryContext mctx;
+
+		fctx = SRF_FIRSTCALL_INIT();
+
+		if (!superuser())
+			ereport(ERROR,
+					(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						errmsg("must be superuser to use pageinspect functions")));
+
+		relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
+		rel = relation_openrv(relrv, AccessShareLock);
+
+		if (!IS_INDEX(rel) || !IS_BTREE(rel))
+			ereport(ERROR,
+					(errcode(ERRCODE_WRONG_OBJECT_TYPE),
+						errmsg("\"%s\" is not a %s index",
+							RelationGetRelationName(rel), "btree")));
+
+		bt_index_block_validate(rel, blkno);
+
+		buf = ReadBuffer(rel, blkno);
+		LockBuffer(buf, BUFFER_LOCK_SHARE);
+
+		opaque = BTPageGetOpaque(BufferGetPage(buf));
+
+		if (!P_ISLEAF(opaque))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("block " INT64_FORMAT " is not a leaf page (level=%u)", blkno, opaque->btpo_level)));
+
+
+		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
+
+		uargs = palloc_object(ua_leaf_page_items);
+
+		/*
+		 * We copy the entire 8192-byte page locally so we can immediately
+		 * release the buffer lock and pin! This prevents holding shared buffer
+		 * locks while client queries process rows.
+		 */
+		uargs->page = palloc(BLCKSZ);
+		memcpy(uargs->page, BufferGetPage(buf), BLCKSZ);
+
+		/* Unlock buffer & close relation immediately */
+		UnlockReleaseBuffer(buf);
+
+		/*
+		 * Copy the index Relation TupleDesc. We need this later to call
+		 * index_deform_tuple() so we can extract column values (Key/Value).
+		 */
+		uargs->index_tupd = CreateTupleDescCopy(RelationGetDescr(rel));
+		relation_close(rel, AccessShareLock);
+
+		/*
+		 * Line pointers on leaf pages are 1-based (FirstOffsetNumber = 1).
+		 * max_calls is PageGetMaxOffsetNumber(page).
+		 */
+		uargs->offset = FirstOffsetNumber;
+		uargs->rightmost = P_RIGHTMOST(opaque);
+
+		if (!P_ISDELETED(opaque) && !P_ISMERGEDAWAY(opaque))
+		{
+			int max_tuples = PageGetMaxOffsetNumber(uargs->page);
+
+			fctx->max_calls = (tuple_count > 0) ? Min(max_tuples, tuple_count) : max_tuples;
+		}
+		else
+			fctx->max_calls = 0;
+
+		/* Prepare result TupleDesc for our 14 OUT columns */
+		if (get_call_result_type(fcinfo, NULL, &tupleDesc) != TYPEFUNC_COMPOSITE)
+			elog(ERROR, "return type must be a row type");
+		uargs->result_tupd = BlessTupleDesc(tupleDesc);
+
+		fctx->user_fctx = uargs;
+		MemoryContextSwitchTo(mctx);
+	}
+
+	fctx = SRF_PERCALL_SETUP();
+	uargs = (ua_leaf_page_items *) fctx->user_fctx;
+
+	if (fctx->call_cntr < fctx->max_calls)
+	{
+		Page		page = uargs->page;
+		OffsetNumber offset = uargs->offset;
+		ItemId		id;
+		IndexTuple	itup;
+		Datum		values[14];
+		bool		nulls[14];
+		HeapTuple	resultTuple;
+		Datum		result;
+
+		memset(nulls, 0, sizeof(nulls));
+
+		id = PageGetItemId(page, offset);
+		values[0] = Int16GetDatum(offset);
+		values[2] = Int32GetDatum(ItemIdGetOffset(id));
+		values[3] = Int32GetDatum(ItemIdGetLength(id));
+
+		switch (ItemIdGetFlags(id))
+		{
+				case LP_UNUSED:
+                    values[4] = CStringGetTextDatum("UNUSED");
+                    break;
+                case LP_NORMAL:
+                    values[4] = CStringGetTextDatum("NORMAL");
+                    break;
+                case LP_REDIRECT:
+                    values[4] = CStringGetTextDatum("REDIRECT");
+                    break;
+                case LP_DEAD:
+                    values[4] = CStringGetTextDatum("DEAD");
+                    break;
+                default:
+                    values[4] = CStringGetTextDatum("UNKNOWN");
+                    break;
+		}
+
+		if(!ItemIdIsUsed(id))
+		{
+			for(int c = 5; c < 14; c++)
+				nulls[c] = true;
+			
+			values[1] = CStringGetTextDatum("UNUSED_SLOT");
+			resultTuple = heap_form_tuple(uargs->result_tupd, values, nulls);
+			result = HeapTupleGetDatum(resultTuple); 
+			uargs->offset++;
+			SRF_RETURN_NEXT(fctx, result);
+		}
+
+		itup = (IndexTuple) PageGetItem(page, id);
+
+		if (!uargs->rightmost && offset == P_HIKEY)
+			values[1] = CStringGetTextDatum("HIGH_KEY");
+		else if (BTreeTupleIsPosting(itup))
+			values[1] = CStringGetTextDatum("POSTING_TUPLE");
+		else
+			values[1] = CStringGetTextDatum("LEAF_ITEM");
+
+
+		if (!uargs->rightmost && offset == P_HIKEY) 
+			nulls[5] = true;
+		else 
+			values[5] = ItemPointerGetDatum(&itup->t_tid);
+		
+		values[6] = Int32GetDatum((int32)itup->t_info);
+
+		values[7] = BoolGetDatum(IndexTupleHasNulls(itup));
+		values[8] = BoolGetDatum(IndexTupleHasVarwidths(itup));
+		values[9] = BoolGetDatum(BTreeTupleIsPosting(itup));
+
+		if (IndexTupleHasNulls(itup))
+		{
+			StringInfoData	bmap_buf;
+			initStringInfo(&bmap_buf);
+
+			for(int att = 0; att < uargs->index_tupd->natts; att++)
+			{
+				if(att_isnull(att, (uint8*) itup + sizeof(IndexTupleData)))
+					appendStringInfoChar(&bmap_buf, '1');
+				else
+					appendStringInfoChar(&bmap_buf, '0');
+			}
+			values[10] = CStringGetTextDatum(bmap_buf.data);
+		}
+		else 
+			nulls[10] = true;
+
+		{
+			int natts = uargs->index_tupd->natts;
+			Datum keyDatums[INDEX_MAX_KEYS];
+			bool keyNulls[INDEX_MAX_KEYS];
+
+			Datum *keyTexts = palloc0_array(Datum, natts);
+
+			index_deform_tuple(itup, uargs->index_tupd, keyDatums, keyNulls);
+
+			for (int att = 0; att < natts; att++)
+			{
+				if(keyNulls[att])
+					keyTexts[att] = CStringGetTextDatum("NULL");
+				else
+				{
+					Oid atttypid	= TupleDescAttr(uargs->index_tupd, att)->atttypid;
+					Oid outfunc;
+					bool isvarlena;
+					char *valstr;
+
+					getTypeOutputInfo(atttypid, &outfunc, &isvarlena);
+
+					valstr = OidOutputFunctionCall(outfunc, keyDatums[att]);
+
+					keyTexts[att] = CStringGetTextDatum(valstr);
+				}
+			}
+			values[11] = PointerGetDatum(construct_array_builtin(keyTexts, natts, TEXTOID));
+		}
+
+		if (BTreeTupleIsPosting(itup))
+		{
+			int         nposting = BTreeTupleGetNPosting(itup); 
+			ItemPointer tids = BTreeTupleGetPosting(itup);
+			Datum      *tids_datum = palloc0_array(Datum, nposting);
+
+			for (int p = 0; p < nposting; p++)
+				tids_datum[p] = ItemPointerGetDatum(&tids[p]);
+			
+			values[12] = Int32GetDatum(nposting);
+			values[13] = PointerGetDatum(construct_array_builtin(tids_datum, nposting, TIDOID));
+		}
+		else
+		{
+			nulls[12] = true;
+            nulls[13] = true;
+		}
+
+		resultTuple = heap_form_tuple(uargs->result_tupd, values, nulls);
+		result = HeapTupleGetDatum(resultTuple);
+
+		uargs->offset++;
+		SRF_RETURN_NEXT(fctx, result);
+	}
+
+	SRF_RETURN_DONE(fctx);
 }

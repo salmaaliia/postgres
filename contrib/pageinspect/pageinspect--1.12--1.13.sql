@@ -135,3 +135,47 @@ CREATE FUNCTION bt_merge(
 RETURNS int4
 AS 'MODULE_PATHNAME', 'bt_merge'
 LANGUAGE C PARALLEL SAFE;
+
+CREATE FUNCTION bt_page_header(
+    IN  relname text,
+    IN  blkno   bigint,
+    OUT blkno   bigint,
+    OUT lsn     pg_lsn,
+    OUT checksum    integer,
+    OUT lower_off   integer,
+    OUT upper_off   integer,
+    OUT special_off integer,
+    OUT free_bytes integer,                                                                       
+    OUT page_level integer,                                                                       
+    OUT prev_blk bigint,                                                                          
+    OUT next_blk bigint,                                                                          
+    OUT opaque_flags text,
+    OUT ma_blkno    bigint,
+    OUT item_count  integer,
+    OUT free_prct   float8
+)
+AS 'MODULE_PATHNAME', 'bt_page_header'                                                       
+LANGUAGE C STRICT PARALLEL SAFE; 
+
+CREATE FUNCTION bt_leaf_page_items_detailed(                                                      
+    IN relname text,
+    IN blkno bigint,
+    IN tuplecount integer,                           
+    OUT item_offset smallint,
+    OUT item_role text,                                                                           
+    OUT lp_off integer,                                                                           
+    OUT lp_len integer,                                                                           
+    OUT lp_flags text,                                                                            
+    OUT t_tid tid,                                                                                
+    OUT t_info_raw integer,                                                                       
+    OUT has_nulls boolean,                                                                        
+    OUT has_varwidths boolean,                                                                    
+    OUT is_posting boolean,                                                                       
+    OUT null_bitmap text,                                                                         
+    OUT keys_decoded text[],                                                                      
+    OUT posting_count integer,                                                                    
+    OUT posting_tids tid[]                                                                           
+)                                                                                                 
+RETURNS SETOF record                                                                              
+AS 'MODULE_PATHNAME', 'bt_leaf_page_items_detailed'                                               
+LANGUAGE C STRICT PARALLEL SAFE; 
