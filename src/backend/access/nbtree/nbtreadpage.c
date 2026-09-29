@@ -255,6 +255,36 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 			itup = (IndexTuple) PageGetItem(page, iid);
 			Assert(!BTreeTupleIsPivot(itup));
 
+			if(so->needMergeRecovery && so->boundaryKey != NULL && P_ISMERGED(opaque))
+			{
+				int cmp = _bt_compare(rel, so->boundaryKey, page, offnum);
+				if(cmp > 0)
+				{
+					offnum = OffsetNumberNext(offnum);
+					continue;
+				} 
+				else if (cmp == 0)
+				{
+					if(!BTreeTupleIsPosting(itup))
+					{
+						if(ItemPointerCompare(&itup->t_tid, &so->boundaryTid) <= 0)
+						{
+							offnum = OffsetNumberNext(offnum);
+							continue;
+						}
+					}
+					else
+					{
+						/* Posting list tuple: skip if max TID <= boundary TID */
+						if(ItemPointerCompare(BTreeTupleGetMaxHeapTID(itup),  &so->boundaryTid) <= 0)
+						{
+							offnum = OffsetNumberNext(offnum);
+							continue;
+						}
+					}
+				}
+			}
+
 			pstate.offnum = offnum;
 			passes_quals = _bt_checkkeys(scan, &pstate, arrayKeys,
 										 itup, indnatts);
@@ -286,17 +316,28 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 				else
 				{
 					int			tupleOffset;
+					bool 		first = true;
 
-					/* Set up posting list state (and remember first TID) */
-					tupleOffset =
-						_bt_setuppostingitems(so, itemIndex, offnum,
-											  BTreeTupleGetPostingN(itup, 0),
-											  itup);
-					itemIndex++;
-
-					/* Remember all later TIDs (must be at least one) */
-					for (int i = 1; i < BTreeTupleGetNPosting(itup); i++)
+					for (int i = 0; i < BTreeTupleGetNPosting(itup); i++)
 					{
+						if(so->needMergeRecovery && so->boundaryKey != NULL && P_ISMERGED(opaque))
+						{
+							if(ItemPointerCompare(BTreeTupleGetPostingN(itup, i), &so->boundaryTid) <= 0)
+								continue;
+						}
+
+						if(first)
+						{
+							first = false;
+							/* Set up posting list state (and remember first TID) */
+							tupleOffset =
+								_bt_setuppostingitems(so, itemIndex, offnum,
+													  BTreeTupleGetPostingN(itup, i),
+													  itup);
+							itemIndex++;
+							continue;
+						}
+						/* Remember all later TIDs (must be at least one) */
 						_bt_savepostingitem(so, itemIndex, offnum,
 											BTreeTupleGetPostingN(itup, i),
 											tupleOffset);
@@ -418,6 +459,37 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 			itup = (IndexTuple) PageGetItem(page, iid);
 			Assert(!BTreeTupleIsPivot(itup));
 
+			if(so->needMergeRecovery && so->boundaryKey != NULL && P_ISMERGED(opaque))
+			{
+				int cmp = _bt_compare(rel, so->boundaryKey, page, offnum);
+
+				if(cmp < 0)
+				{
+					offnum = OffsetNumberPrev(offnum);
+					continue;
+				}
+				else if (cmp == 0)
+				{
+					if(!BTreeTupleIsPosting(itup))
+					{
+						if(ItemPointerCompare(&itup->t_tid, &so->boundaryTid) >= 0)
+						{
+							offnum = OffsetNumberPrev(offnum);
+							continue;
+						}
+						
+					}
+					else
+					{
+						if(ItemPointerCompare(BTreeTupleGetHeapTID(itup), &so->boundaryTid) >= 0)
+						{
+							offnum = OffsetNumberPrev(offnum);
+							continue;
+						}
+					}
+				}
+			}
+
 			pstate.offnum = offnum;
 			if (arrayKeys && offnum == minoff && pstate.forcenonrequired)
 			{
@@ -472,18 +544,31 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 				{
 					uint16		nitems = BTreeTupleGetNPosting(itup);
 					int			tupleOffset;
+					bool		first 	= true;
 
-					/* Set up posting list state (and remember last TID) */
-					itemIndex--;
-					tupleOffset =
-						_bt_setuppostingitems(so, itemIndex, offnum,
-											  BTreeTupleGetPostingN(itup, nitems - 1),
-											  itup);
-
-					/* Remember all prior TIDs (must be at least one) */
-					for (int i = nitems - 2; i >= 0; i--)
+					
+					for (int i = nitems - 1; i >= 0; i--)
 					{
+						if(so->needMergeRecovery && so->boundaryKey != NULL && P_ISMERGED(opaque))
+						{
+							if(ItemPointerCompare(BTreeTupleGetPostingN(itup, i), &so->boundaryTid) >= 0)
+								continue;
+						}
+
 						itemIndex--;
+						
+						if(first)
+						{
+							first = false;
+							/* Set up posting list state (and remember last TID) */
+							tupleOffset =
+								_bt_setuppostingitems(so, itemIndex, offnum,
+													  BTreeTupleGetPostingN(itup, i),
+													  itup);
+							continue;
+						}
+
+						/* Remember all prior TIDs (must be at least one) */
 						_bt_savepostingitem(so, itemIndex, offnum,
 											BTreeTupleGetPostingN(itup, i),
 											tupleOffset);
@@ -523,6 +608,31 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 	 * arrays to recover.  Assert that that step hasn't been missed.
 	 */
 	Assert(!pstate.forcenonrequired);
+
+	if (!so->needMergeRecovery && so->currPos.firstItem <= so->currPos.lastItem)
+	{
+		int boundItemIndex = ScanDirectionIsForward(dir) ? so->currPos.lastItem : so->currPos.firstItem;
+		BTScanPosItem *item = &so->currPos.items[boundItemIndex];
+		ItemId iid = PageGetItemId(page, item->indexOffset);
+		IndexTuple itup = (IndexTuple) PageGetItem(page, iid);
+
+		if (so->boundaryKey)
+		{
+			pfree(so->boundaryKey);
+			so->boundaryKey = NULL;
+		}
+		if (so->boundaryItup)
+		{
+			pfree(so->boundaryItup);
+			so->boundaryItup = NULL;
+		}
+
+		so->boundaryItup = CopyIndexTuple(itup);
+		so->boundaryKey = _bt_mkscankey(rel, so->boundaryItup);
+
+		so->boundaryTid = item->heapTid;
+		so->boundaryKey->scantid = &so->boundaryTid;
+	}
 
 	return (so->currPos.firstItem <= so->currPos.lastItem);
 }

@@ -352,7 +352,7 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 
 	/* allocate private workspace */
-	so = palloc_object(BTScanOpaqueData);
+	so = palloc0_object(BTScanOpaqueData);
 	BTScanPosInvalidate(so->currPos);
 	BTScanPosInvalidate(so->markPos);
 	if (scan->numberOfKeys > 0)
@@ -381,8 +381,10 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	/* Initialize merge fields */
 	so->skipMergeRecovery = false;
 	so->needMergeRecovery = false;
-	so->nSavedMergeTids = 0;
 	so->mergedAwayBlkno = InvalidBlockNumber;
+	so->boundaryKey = NULL;
+	so->boundaryItup = NULL;
+	ItemPointerSetInvalid(&so->boundaryTid);
 
 	scan->xs_itupdesc = RelationGetDescr(rel);
 
@@ -439,8 +441,19 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 
 	so->skipMergeRecovery = false;
 	so->needMergeRecovery = false;
-	so->nSavedMergeTids = 0;
 	so->mergedAwayBlkno = InvalidBlockNumber;
+
+	if (so->boundaryKey)
+	{
+		pfree(so->boundaryKey);
+		so->boundaryKey = NULL;
+	}
+	if (so->boundaryItup)
+	{
+		pfree(so->boundaryItup);
+		so->boundaryItup = NULL;
+	}
+	ItemPointerSetInvalid(&so->boundaryTid);
 
 	/*
 	 * Allocate tuple workspace arrays, if needed for an index-only scan and
@@ -484,6 +497,17 @@ btendscan(IndexScanDesc scan)
 	BTScanPosUnpinIfPinned(so->markPos);
 
 	/* No need to invalidate positions, the RAM is about to be freed. */
+
+	if (so->boundaryKey)
+	{
+		pfree(so->boundaryKey);
+		so->boundaryKey = NULL;
+	}
+	if (so->boundaryItup)
+	{
+		pfree(so->boundaryItup);
+		so->boundaryItup = NULL;
+	}
 
 	/* Release storage */
 	if (so->keyData != NULL)

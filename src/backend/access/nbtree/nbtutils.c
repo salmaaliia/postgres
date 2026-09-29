@@ -28,6 +28,7 @@
 #include "storage/subsystems.h"
 #include "utils/datum.h"
 #include "utils/lsyscache.h"
+#include "utils/injection_point.h"
 #include "utils/rel.h"
 
 
@@ -203,6 +204,8 @@ _bt_killitems(IndexScanDesc scan)
 	Assert(numKilled > 0);
 	Assert(BTScanPosIsValid(so->currPos));
 	Assert(scan->heapRelation != NULL); /* can't be a bitmap index scan */
+
+	INJECTION_POINT("before_bt_killitems", NULL);
 
 	/* Always invalidate so->killedItems[] before leaving so->currPos */
 	so->numKilled = 0;
