@@ -1197,9 +1197,11 @@ typedef struct BTScanOpaqueData
 	bool		skipMergeRecovery;
 	bool		needMergeRecovery;
 
-	ItemPointerData savedMergeTids[MaxTIDsPerBTreePage];
-	int			nSavedMergeTids;	/* number of TIDs in the array */
 	BlockNumber mergedAwayBlkno;	/* blkno of L (BTP_MERGED_AWAY page) */
+	
+	BTScanInsert    boundaryKey;     /* Pre-built insertion scan key */  
+	IndexTuple      boundaryItup;                                                                                                                
+    ItemPointerData boundaryTid;     /* Exact Heap TID of boundary item */   
 
 } BTScanOpaqueData;
 

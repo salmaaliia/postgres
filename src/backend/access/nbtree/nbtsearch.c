@@ -46,11 +46,8 @@ static bool _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 static Buffer _bt_lock_and_validate_left(Relation rel, BlockNumber *blkno,
 										 BlockNumber lastcurrblkno);
 static bool _bt_endpoint(IndexScanDesc scan, ScanDirection dir);
-static void _bt_removeduplicates(IndexScanDesc scan);
 static void _bt_find_merge_tail(IndexScanDesc scan, BlockNumber m_blkno, BlockNumber *blkno,
 								BlockNumber *lastcurrblkno);
-static void _bt_copylastreadpagedata(IndexScanDesc scan);
-static int	compare(const void *a, const void *b);
 
 /*
  *	_bt_drop_lock_and_maybe_pin()
@@ -2015,6 +2012,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 			{
 				if (so->mergedAwayBlkno != blkno)
 				{
+					/** First time to see this page so we reset the recovery flag to false */
 					so->skipMergeRecovery = false;
 					so->needMergeRecovery = false;
 				}
@@ -2047,19 +2045,17 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 					 */
 					so->needMergeRecovery = true;
 
-					/*
-					 * 1- Save the TIDs we already read to filter them out
-					 * later
+					/**
+					 * Boundary state is already saved at the end of _bt_readpage 
+					 * before the merge.
 					 */
-					_bt_copylastreadpagedata(scan);
 
 					/*
-					 * 2- Trigger the rightward walk at the end of the loop to
+					 * Trigger the rightward walk at the end of the loop to
 					 * find the tail page
 					 */
 					needMergeRecoverWalk = true;
-					m_blkno = opaque->btpo_next;	/* The start of the merged
-													 * group */
+					m_blkno = opaque->btpo_next;	/* The start of the merged group */
 				}
 			}
 		}
@@ -2073,90 +2069,30 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 					so->mergedAwayBlkno = BTMergedPageGetMABlkno(page);
 				}
 
-				/*
-				 * Case 1: We passed the BTP_MERGED_AWAY page already and that
-				 * merged away page we have its blkno saved (will do this part
-				 * later). We read this page as a normal page.
-				 */
-				if (so->skipMergeRecovery)
-				{
-					if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque), seized))
-						break;
-					blkno = so->currPos.nextPage;
-				}
-				else
+				if (!so->skipMergeRecovery)
 				{
 					/*
-					 * FWD SCAN: Recovery Mode We read the left page before it
-					 * was merged.
+					 * First time hitting the merged group! Boundary state is
+					 * already saved at the end of _bt_readpage before the merge.
 					 */
-					if (!so->needMergeRecovery)
-					{
-						/*
-						 * First time hitting the merged group! Save L's items
-						 * to filter them out of R and any split descendants.
-						 */
-						_bt_copylastreadpagedata(scan);
-						so->needMergeRecovery = true;
-					}
-
-					if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque), seized))
-					{
-						_bt_removeduplicates(scan);
-
-						/*
-						 * Only break to return if we still have unfiltered
-						 * tuples
-						 */
-						if (so->currPos.lastItem >= so->currPos.firstItem)
-							break;
-					}
-					blkno = so->currPos.nextPage;
+					so->needMergeRecovery = true;
 				}
+
+				if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque), seized))
+					break;
+				blkno = so->currPos.nextPage;
 			}
 			else
 			{
 				so->mergedAwayBlkno = BTMergedPageGetMABlkno(page);
 
-				/*
-				 * BACKWARD SCAN: Merged Page (BTP_MERGED)
-				 */
-				if (so->needMergeRecovery)
-				{
-					/*
-					 * We are currently walking backward through the recovery
-					 * group. Read the page, but filter out tuples we already
-					 * saw.
-					 */
-					if (_bt_readpage(scan, dir, PageGetMaxOffsetNumber(page), seized))
-					{
-						_bt_removeduplicates(scan);
-
-						/*
-						 * Only break to return if we still have unfiltered
-						 * tuples
-						 */
-						if (so->currPos.lastItem >= so->currPos.firstItem)
-							break;
-					}
-
-					blkno = so->currPos.prevPage;	/* Step left to the next
-													 * page in the group */
-				}
-				else
-				{
-					/*
-					 * Normal backward scan. We hit a merged page directly.
-					 * Set the skip flag so when we step left onto the
-					 * tombstone, we skip it.
-					 */
+				if(!so->needMergeRecovery)
 					so->skipMergeRecovery = true;
 
-					if (_bt_readpage(scan, dir, PageGetMaxOffsetNumber(page), seized))
-						break;
+				if (_bt_readpage(scan, dir, PageGetMaxOffsetNumber(page), seized))
+					break;
 
-					blkno = so->currPos.prevPage;
-				}
+				blkno = so->currPos.prevPage;
 			}
 		}
 
@@ -2285,116 +2221,6 @@ _bt_find_merge_tail(IndexScanDesc scan, BlockNumber m_blkno, BlockNumber *blkno,
 		l_page = r_page;
 		l_opaque = r_opaque;
 	}
-}
-
-
-/*
- *	_bt_copylastreadpagedata() -- Snapshot heap TIDs from the last-read page
- *								 into savedMergeTids before they are overwritten.
- *
- * currPos.items is overwritten by every call to _bt_readpage.  When merge
- * recovery is triggered (either forward or backward), we must preserve the
- * TIDs that were already returned (or about to be returned) from the
- * MERGED_AWAY page so that _bt_removeduplicates can filter them out of the
- * MERGED pages' contents later.
- *
- * Copies every heapTid from currPos.items[firstItem..lastItem] into
- * so->savedMergeTids and sets so->nSavedMergeTids accordingly.  The array
- * is sorted in place (using ItemPointerCompare) so that _bt_removeduplicates
- * can use bsearch() for O(log n) lookups.
- *
- * Must be called while currPos still reflects the page whose TIDs we want
- * to save, i.e. before the next _bt_readpage call.
- */
-static void
-_bt_copylastreadpagedata(IndexScanDesc scan)
-{
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	int			firstItem = so->currPos.firstItem;
-	int			lastItem = so->currPos.lastItem;
-	ItemPointerData item;
-
-	so->nSavedMergeTids = 0;
-
-	for (int i = firstItem; i <= lastItem; i++)
-	{
-		item = so->currPos.items[i].heapTid;
-		so->savedMergeTids[so->nSavedMergeTids++] = item;
-	}
-
-	if (so->nSavedMergeTids > 1)
-		qsort(so->savedMergeTids, so->nSavedMergeTids, sizeof(ItemPointerData), compare);
-}
-
-
-/*
- *	compare() -- ItemPointerData comparator for qsort() and bsearch().
- *
- * Used by _bt_copylastreadpagedata to sort savedMergeTids and by
- * _bt_removeduplicates to binary-search within that sorted array.
- */
-static int
-compare(const void *a, const void *b)
-{
-	return ItemPointerCompare((ItemPointer) a, (ItemPointer) b);
-}
-
-/*
- *	_bt_removeduplicates() -- Filter out already-seen TIDs from the current page
- *							  during merge-group recovery.
- *
- * After a concurrent page merge is detected, the MERGED page(s) contain a
- * superset of the tuples from both the original left (MERGED_AWAY) and right
- * pages.  Any TID that was already returned to the caller from the
- * MERGED_AWAY page exists in so->savedMergeTids and must be removed from
- * currPos.items to prevent duplicates being returned.
- *
- * Iterates over currPos.items[firstItem..lastItem] and compacts the array
- * in-place, retaining only items whose heapTid is NOT found in
- * savedMergeTids (which must already be sorted by _bt_copylastreadpagedata).
- * Updates currPos.lastItem and resets currPos.itemIndex to the correct
- * boundary for the current scan direction.
- *
- * Must be called immediately after _bt_readpage on each MERGED page during
- * recovery, before any items are returned to the caller.
- */
-static void
-_bt_removeduplicates(IndexScanDesc scan)
-{
-	BTScanOpaque so = (BTScanOpaque) scan->opaque;
-	int			firstItem = so->currPos.firstItem;
-	int			lastItem = so->currPos.lastItem;
-	int			dest = firstItem;
-	ItemPointerData *item,
-			   *found;
-
-	/* Filter out items whose heap TIDs are in mergedAwayTids list */
-	for (int i = firstItem; i <= lastItem; i++)
-	{
-		item = &so->currPos.items[i].heapTid;
-
-		found = (ItemPointerData *) bsearch(item, so->savedMergeTids, so->nSavedMergeTids, sizeof(ItemPointerData), compare);
-
-		if (found)
-		{
-			/* Skip duplicate item */
-			continue;
-		}
-
-		/* Retain non duplicate item */
-		so->currPos.items[dest] = so->currPos.items[i];
-		dest++;
-	}
-	so->currPos.lastItem = dest - 1;
-
-	/*
-	 * Update itemIndex to point to the correct boundary for the scan
-	 * direction
-	 */
-	if (ScanDirectionIsForward(so->currPos.dir))
-		so->currPos.itemIndex = so->currPos.firstItem;
-	else
-		so->currPos.itemIndex = so->currPos.lastItem;
 }
 
 /*
