@@ -367,8 +367,12 @@ typedef struct xl_btree_merge
 	BlockNumber  left_next;      /* L's right sibling (for btpo_prev of MA page) */ 
 	OffsetNumber poffset;		/* offset of L's downlink in parent */
 	FullTransactionId safemergexid;
+	/*
+	 * In payload of blk 0 (leftbuf / MA page): 
+	 * - boundary_pivot
+	 */
 } xl_btree_merge;
-#define SizeOfBtreeMerge	(offsetof(xl_btree_merge, safemergexid) + sizeof(uint64))
+#define SizeOfBtreeMerge	(offsetof(xl_btree_merge, safemergexid) + sizeof(FullTransactionId))
 
 typedef struct xl_btree_clear_m
 {
@@ -376,7 +380,7 @@ typedef struct xl_btree_clear_m
 								* decoding on standby */
 	FullTransactionId safemergexid;
 } xl_btree_clear_m;
-#define SizeOfBtreeClearM 	(offsetof(xl_btree_clear_m, safemergexid) + sizeof(uint64))
+#define SizeOfBtreeClearM 	(offsetof(xl_btree_clear_m, safemergexid) + sizeof(FullTransactionId))
 
 typedef struct xl_btree_mark_ma_hd
 {
@@ -386,7 +390,7 @@ typedef struct xl_btree_mark_ma_hd
 								 * decoding on standby */
 	FullTransactionId safemergexid;
 } xl_btree_mark_ma_hd;
-#define SizeOfBtreeMarkMaHd 	(offsetof(xl_btree_mark_ma_hd, safemergexid) + sizeof(uint64))
+#define SizeOfBtreeMarkMaHd 	(offsetof(xl_btree_mark_ma_hd, safemergexid) + sizeof(FullTransactionId))
 
 /*
  * prototypes for functions in nbtxlog.c

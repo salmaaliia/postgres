@@ -1025,41 +1025,14 @@ btree_xlog_merge_page(XLogReaderState *record)
 	xl_btree_merge *xlrec = (xl_btree_merge *) XLogRecGetData(record);
 	XLogRecPtr	lsn = record->EndRecPtr;
 	Buffer		buf;
+	Buffer		rbuf = InvalidBuffer;
+	Buffer		pbuf = InvalidBuffer;
 	Page		page;
 	BTPageOpaque pageop;
+	char	   *boundary_pivot;
+	Size		boundary_sz;
 
-	
-	/* parent page */
-	if(XLogReadBufferForRedo(record, 2, &buf) == BLK_NEEDS_REDO){
-		OffsetNumber poffset;
-		ItemId		itemid;
-		IndexTuple	itup;
-		OffsetNumber nextoffset;
-		BlockNumber rightsib;
-
-		page = BufferGetPage(buf);
-		pageop = BTPageGetOpaque(page);
-
-		poffset = xlrec->poffset;
-		nextoffset = OffsetNumberNext(poffset);
-		itemid = PageGetItemId(page, nextoffset);
-		itup = (IndexTuple) PageGetItem(page, itemid);
-		rightsib = BTreeTupleGetDownLink(itup);
-
-		rightsib = BTreeTupleGetDownLink(itup);
-		itemid = PageGetItemId(page, poffset);
-		itup = (IndexTuple) PageGetItem(page, itemid);
-
-		BTreeTupleSetDownLink(itup, rightsib);
-		nextoffset = OffsetNumberNext(poffset);
-		PageIndexTupleDelete(page, nextoffset);
-		PageSetLSN(page, lsn);
-		MarkBufferDirty(buf);
-	}
-	if (BufferIsValid(buf))
-    	UnlockReleaseBuffer(buf);
-	
-	/* Reconstruct	left (MA) page from scratch */
+	/* Reconstruct left (MA) page from scratch */
 	buf = XLogInitBufferForRedo(record, 0);
 	page = BufferGetPage(buf);
 
@@ -1068,20 +1041,54 @@ btree_xlog_merge_page(XLogReaderState *record)
 	pageop->btpo_prev = xlrec->left_prev;
 	pageop->btpo_next = xlrec->left_next;
 	pageop->btpo_level = 0;
-	pageop->btpo_flags =  BTP_LEAF;
+	pageop->btpo_flags = BTP_LEAF;
 	pageop->btpo_cycleid = 0;
 
-	BTPageSetMergedAway(page, xlrec->safemergexid);
+	boundary_pivot = XLogRecGetBlockData(record, 0, &boundary_sz);
+	Assert(boundary_pivot != NULL && boundary_sz > 0);
+
+	BTPageSetMergedAway(page, xlrec->safemergexid, (IndexTuple) boundary_pivot, boundary_sz);
 	PageSetLSN(page, lsn);
 	MarkBufferDirty(buf);
+
+	/* Restore right (M) page */
+	XLogReadBufferForRedo(record, 1, &rbuf);
+
+	/* Update parent page */
+	if (XLogReadBufferForRedo(record, 2, &pbuf) == BLK_NEEDS_REDO)
+	{
+		Page		ppage = BufferGetPage(pbuf);
+		OffsetNumber poffset;
+		ItemId		itemid;
+		IndexTuple	itup;
+		OffsetNumber nextoffset;
+		BlockNumber rightsib;
+
+		poffset = xlrec->poffset;
+		nextoffset = OffsetNumberNext(poffset);
+		itemid = PageGetItemId(ppage, nextoffset);
+		itup = (IndexTuple) PageGetItem(ppage, itemid);
+		rightsib = BTreeTupleGetDownLink(itup);
+
+		itemid = PageGetItemId(ppage, poffset);
+		itup = (IndexTuple) PageGetItem(ppage, itemid);
+
+		BTreeTupleSetDownLink(itup, rightsib);
+		nextoffset = OffsetNumberNext(poffset);
+		PageIndexTupleDelete(ppage, nextoffset);
+		PageSetLSN(ppage, lsn);
+		MarkBufferDirty(pbuf);
+	}
+
+	/*
+	 * Finally, release all buffers together so that readers cannot observe
+	 * inconsistencies.
+	 */
+	if (BufferIsValid(pbuf))
+		UnlockReleaseBuffer(pbuf);
+	if (BufferIsValid(rbuf))
+		UnlockReleaseBuffer(rbuf);
 	UnlockReleaseBuffer(buf);
-
-	/* right (M) page */
-	XLogReadBufferForRedo(record, 1, &buf);
-
-	if (BufferIsValid(buf))
-    	UnlockReleaseBuffer(buf);
-
 }
 static void
 btree_xlog_clear_m_flag(XLogReaderState *record){
@@ -1291,7 +1298,7 @@ btree_mask(char *pagedata, BlockNumber blkno)
 	if(P_ISMERGED(maskopaq))
 		phdr->pd_prune_xid = saved_prune_xid;
 
-	if (P_ISLEAF(maskopaq))
+	if (P_ISLEAF(maskopaq) && !P_ISMERGEDAWAY(maskopaq))
 	{
 		/*
 		 * In btree leaf pages, it is possible to modify the LP_FLAGS without

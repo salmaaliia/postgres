@@ -265,6 +265,7 @@ typedef struct BTMetaPageData
 typedef struct BTMergedAwayPageData
 {
 	FullTransactionId safemergexid;
+	uint16			  boundary_size;
 }			BTMergedAwayPageData;
 
 static inline void
@@ -274,26 +275,32 @@ BTPageSetMerged(Page page)
 
 	opaque = BTPageGetOpaque(page);
 	opaque->btpo_flags |= BTP_MERGED;
-
 }
 
 static inline void
-BTPageSetMergedAway(Page page, FullTransactionId safemergexid)
+BTPageSetMergedAway(Page page, FullTransactionId safemergexid, 
+					IndexTuple boundaryitup, Size boundarysz)
 {
 	BTPageOpaque opaque;
 	PageHeader	header;
 	BTMergedAwayPageData *contents;
+	char        *dest;
 
 	opaque = BTPageGetOpaque(page);
 	header = ((PageHeader) page);
 
 	opaque->btpo_flags |= BTP_MERGED_AWAY | BTP_HAS_FULLXID;
-	header->pd_lower = MAXALIGN(SizeOfPageHeaderData) +
-		sizeof(BTMergedAwayPageData);
+	header->pd_lower	= 	MAXALIGN(SizeOfPageHeaderData) +
+							MAXALIGN(sizeof(BTMergedAwayPageData)) +
+							MAXALIGN(boundarysz);
 	header->pd_upper = header->pd_special;
 
 	contents = (BTMergedAwayPageData *) PageGetContents(page);
 	contents->safemergexid = safemergexid;
+	contents->boundary_size	= boundarysz;
+
+	dest = ((char *) contents) + MAXALIGN(sizeof(BTMergedAwayPageData));
+	memcpy(dest, boundaryitup, boundarysz);
 }
 
 static inline FullTransactionId
@@ -1199,9 +1206,8 @@ typedef struct BTScanOpaqueData
 
 	BlockNumber mergedAwayBlkno;	/* blkno of L (BTP_MERGED_AWAY page) */
 	
-	BTScanInsert    boundaryKey;     /* Pre-built insertion scan key */  
-	IndexTuple      boundaryItup;                                                                                                                
-    ItemPointerData boundaryTid;     /* Exact Heap TID of boundary item */   
+	BTScanInsert    mergeBoundaryKey;     /* Pre-built insertion scan key */ 
+	IndexTuple      mergeBoundaryItup;
 
 } BTScanOpaqueData;
 
@@ -1302,6 +1308,8 @@ extern void _bt_parallel_release(IndexScanDesc scan,
 extern void _bt_parallel_done(IndexScanDesc scan);
 extern void _bt_parallel_primscan_schedule(IndexScanDesc scan,
 										   BlockNumber curr_page);
+extern void _bt_parallel_set_skip_ma(IndexScanDesc scan, BlockNumber blkno);
+extern BlockNumber _bt_parallel_get_skip_ma(IndexScanDesc scan);
 
 /*
  * prototypes for functions in nbtdedup.c

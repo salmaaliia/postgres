@@ -75,6 +75,7 @@ typedef struct BTParallelScanDescData
 	BlockNumber btps_nextScanPage;	/* next page to be scanned */
 	BlockNumber btps_lastCurrPage;	/* page whose sibling link was copied into
 									 * btps_nextScanPage */
+	BlockNumber btps_skipMABlkno; 	/* MA tombstone blkno skipped by a worker */
 	BTPS_State	btps_pageStatus;	/* indicates whether next page is
 									 * available for scan. see above for
 									 * possible states of parallel scan. */
@@ -382,9 +383,8 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	so->skipMergeRecovery = false;
 	so->needMergeRecovery = false;
 	so->mergedAwayBlkno = InvalidBlockNumber;
-	so->boundaryKey = NULL;
-	so->boundaryItup = NULL;
-	ItemPointerSetInvalid(&so->boundaryTid);
+	so->mergeBoundaryKey = NULL;
+	so->mergeBoundaryItup = NULL;
 
 	scan->xs_itupdesc = RelationGetDescr(rel);
 
@@ -443,17 +443,16 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	so->needMergeRecovery = false;
 	so->mergedAwayBlkno = InvalidBlockNumber;
 
-	if (so->boundaryKey)
+	if (so->mergeBoundaryKey)
 	{
-		pfree(so->boundaryKey);
-		so->boundaryKey = NULL;
+		pfree(so->mergeBoundaryKey);
+		so->mergeBoundaryKey = NULL;
 	}
-	if (so->boundaryItup)
+	if (so->mergeBoundaryItup)
 	{
-		pfree(so->boundaryItup);
-		so->boundaryItup = NULL;
+		pfree(so->mergeBoundaryItup);
+		so->mergeBoundaryItup = NULL;
 	}
-	ItemPointerSetInvalid(&so->boundaryTid);
 
 	/*
 	 * Allocate tuple workspace arrays, if needed for an index-only scan and
@@ -498,15 +497,15 @@ btendscan(IndexScanDesc scan)
 
 	/* No need to invalidate positions, the RAM is about to be freed. */
 
-	if (so->boundaryKey)
+	if (so->mergeBoundaryKey)
 	{
-		pfree(so->boundaryKey);
-		so->boundaryKey = NULL;
+		pfree(so->mergeBoundaryKey);
+		so->mergeBoundaryKey = NULL;
 	}
-	if (so->boundaryItup)
+	if (so->mergeBoundaryItup)
 	{
-		pfree(so->boundaryItup);
-		so->boundaryItup = NULL;
+		pfree(so->mergeBoundaryItup);
+		so->mergeBoundaryItup = NULL;
 	}
 
 	/* Release storage */
@@ -932,6 +931,9 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 	BTScanPosInvalidate(so->currPos);
 	so->currPos.moreLeft = so->currPos.moreRight = true;
 
+	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
+												  parallel_scan->ps_offset_am);
+
 	if (first)
 	{
 		/*
@@ -941,6 +943,7 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 		so->needPrimScan = false;
 		so->scanBehind = false;
 		so->oppositeDirCheck = false;
+		btscan->btps_skipMABlkno = InvalidBlockNumber;
 	}
 	else
 	{
@@ -951,9 +954,6 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 		if (so->needPrimScan)
 			return false;
 	}
-
-	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
-												  parallel_scan->ps_offset_am);
 
 	while (1)
 	{
@@ -2139,3 +2139,38 @@ bttranslatecmptype(CompareType cmptype, Oid opfamily)
 			return InvalidStrategy;
 	}
 }
+
+void                                                                                              
+_bt_parallel_set_skip_ma(IndexScanDesc scan, BlockNumber blkno)
+{
+	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
+	BTParallelScanDesc btscan;
+
+	if(scan->parallel_scan == NULL)
+		return;
+
+	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
+											  parallel_scan->ps_offset_am);
+
+	LWLockAcquire(&btscan->btps_lock, LW_EXCLUSIVE);
+	btscan->btps_skipMABlkno = blkno;
+	LWLockRelease(&btscan->btps_lock);
+}
+
+BlockNumber _bt_parallel_get_skip_ma(IndexScanDesc scan)
+{
+	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
+	BTParallelScanDesc btscan;
+	BlockNumber blkno;
+
+	if(!scan->parallel_scan)
+		return InvalidBlockNumber;
+
+	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
+											  parallel_scan->ps_offset_am);
+	LWLockAcquire(&btscan->btps_lock, LW_SHARED);
+	blkno =  btscan->btps_skipMABlkno;
+	LWLockRelease(&btscan->btps_lock);
+	return blkno;
+}
+
