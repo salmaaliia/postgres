@@ -58,6 +58,16 @@ static IndexTuple _bt_build_boundary_pivot(Relation rel, IndexTuple itup);
 int32
 _bt_merge_index(Relation rel, float8 min_pct, float8 dest_pct, int32 num_pages)
 {
+	bool	heapkeyspace;
+    bool	allequalimage;
+	_bt_metaversion(rel, &heapkeyspace, &allequalimage);
+	if (!heapkeyspace)
+		ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot merge pages of index \"%s\" because it is a version 3 or older btree",
+								RelationGetRelationName(rel)),
+					 errhint("Use REINDEX to upgrade the index first.")));
+
 	return _bt_mergescan(rel, min_pct, dest_pct, num_pages);
 }
 

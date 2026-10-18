@@ -1036,6 +1036,8 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 	Datum		values[5];
 	bool		nulls[5];
 	HeapTuple	tuple;
+	bool		heapkeyspace;
+    bool		allequalimage;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -1056,7 +1058,15 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		if (!IS_INDEX(rel) || !IS_BTREE(rel))
 			ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
 							errmsg("\"%s\" is not a %s index",
-								   RelationGetRelationName(rel), "btree")));
+									RelationGetRelationName(rel), "btree")));
+
+		_bt_metaversion(rel, &heapkeyspace, &allequalimage);
+		if (!heapkeyspace)
+			ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("cannot merge pages of index \"%s\" because it is a version 3 or older btree",
+									RelationGetRelationName(rel)),
+						 errhint("Use REINDEX to upgrade the index first.")));
 
 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
 		uargs = palloc_object(ua_merge_candidates);
