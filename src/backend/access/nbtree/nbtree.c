@@ -1841,6 +1841,8 @@ backtrack:
 		 * deletable tuples --- see nbtree/README.
 		 */
 		_bt_upgradelockbufcleanup(rel, buf);
+		
+		Assert(!P_ISMERGEDAWAY(opaque));
 
 		/*
 		 * Check whether we need to backtrack to earlier pages.  What we are
