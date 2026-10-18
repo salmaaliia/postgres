@@ -325,6 +325,7 @@ _bt_mergepage(BTMergeState mstate)
 	FullTransactionId safemergexid;
 	bool		merged = false;
 	XLogRecPtr	recptr;
+	BTCycleId   cycleid;
 
 	parent_blkno = stack->bts_blkno;
 
@@ -444,6 +445,13 @@ _bt_mergepage(BTMergeState mstate)
 
 	safemergexid = ReadNextFullTransactionId();
 
+	/*
+	 * Read the active VACUUM cycle ID now, while L and R are locked.  A
+	 * VACUUM that starts after this cannot get past either page until we are
+	 * done.
+	 */
+	cycleid = _bt_vacuum_cycleid(rel);
+
 	itup	= (IndexTuple) PageGetItem(leftpage, 
 										PageGetItemId(leftpage, PageGetMaxOffsetNumber(leftpage)));
 	boundary_pivot	=	_bt_build_boundary_pivot(rel, itup);
@@ -461,6 +469,12 @@ _bt_mergepage(BTMergeState mstate)
 	saved_opaque = *rightopaque;
 	PageInit(rightpage, BufferGetPageSize(rightbuf), sizeof(BTPageOpaqueData));
 	*BTPageGetOpaque(rightpage) = saved_opaque;
+
+	/*
+	 * Stamp R with the cycle ID, as a split does for its new pages.  If this
+	 * VACUUM has already passed R, the stamp tells it that R got new tuples.
+	 */
+	rightopaque->btpo_cycleid = cycleid;
 
 	if (r_hikey != NULL)
 	{
@@ -501,6 +515,13 @@ _bt_mergepage(BTMergeState mstate)
 	saved_opaque = *leftopaque;
 	PageInit(leftpage, BufferGetPageSize(leftbuf), sizeof(BTPageOpaqueData));
 	*BTPageGetOpaque(leftpage) = saved_opaque;
+
+	/*
+	 * Stamp the tombstone too.  L can be at a higher block than R, so VACUUM
+	 * may reach L after passing R.  The restore of saved_opaque above brought
+	 * back L's old stamp, so this has to come after it.
+	 */
+	leftopaque->btpo_cycleid = cycleid;
 	BTPageSetMergedAway(leftpage, safemergexid, boundary_pivot, IndexTupleSize(boundary_pivot));
 
 	MarkBufferDirty(leftbuf);

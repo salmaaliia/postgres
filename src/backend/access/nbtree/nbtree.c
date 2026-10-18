@@ -1446,7 +1446,8 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
  * a previous call here.  This is how we handle page splits (that happened
  * after our cycleid was acquired) whose right half page happened to reuse
  * a block that we might have processed at some point before it was
- * recycled (i.e. before the page split).
+ * recycled (i.e. before the page split).  Merges that move tuples into an
+ * already scanned page are handled the same way.
  *
  * Returns BlockNumber of a scanned page (not backtracked).
  */
@@ -1561,7 +1562,25 @@ backtrack:
 	{
 		FullTransactionId safemergexid = BTMergedAwayGetSafeXid(page);
 
-		if (GlobalVisCheckRemovableFullXid(heaprel, safemergexid))
+		/*
+		 * A merge during this VACUUM may have moved dead tuples from this
+		 * page (not yet visited) into R, a page we already passed.  If so,
+		 * backtrack to R, as for a split.  This must happen even if the
+		 * tombstone is too new to reclaim, and it ignores BTP_SPLIT_END
+		 * because a stale flag may be left from before the merge.
+		 */
+		if (vstate->cycleid != 0 &&
+			opaque->btpo_cycleid == vstate->cycleid &&
+			!P_RIGHTMOST(opaque) &&
+			opaque->btpo_next < scanblkno)
+			backtrack_to = opaque->btpo_next;
+
+		/*
+		 * Only reclaim the tombstone when it is the scan page.  While
+		 * backtracking we must not delete pages, as in the leaf case below.
+		 */
+		if (blkno == scanblkno &&
+			GlobalVisCheckRemovableFullXid(heaprel, safemergexid))
 		{
 			BlockNumber tail_blkno;
 			BlockNumber curr_blkno = opaque->btpo_next;
