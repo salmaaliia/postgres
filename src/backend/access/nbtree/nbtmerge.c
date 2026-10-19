@@ -42,10 +42,9 @@ typedef struct BTMergeState
 
 static int32 _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_limit);
 static bool _bt_mergepage(BTMergeState mstate);
-static BTScanInsert _bt_merge_mkscankey(Relation rel, Page page, BTPageOpaque opaque);
+static BTScanInsert _bt_merge_mkscankey(Relation rel, Page page, BTPageOpaque opaque, IndexTuple *keytuple);
 static bool _bt_pages_mergeable(Page leftpage, Page rightpage, float8 min_threshold, float8 fillfactor);
 static IndexTuple _bt_build_boundary_pivot(Relation rel, IndexTuple itup);
-
 /*
  * _bt_merge_index() -- Entry point: merge underutilized leaf pages.
  *
@@ -78,16 +77,17 @@ _bt_merge_index(Relation rel, float8 min_pct, float8 dest_pct, int32 num_pages)
  * must pfree the returned key.
  */
 static BTScanInsert
-_bt_merge_mkscankey(Relation rel, Page page, BTPageOpaque opaque)
+_bt_merge_mkscankey(Relation rel, Page page, BTPageOpaque opaque, IndexTuple *keytuple)
 {
 	OffsetNumber first_off = P_FIRSTDATAKEY(opaque);
 
+	*keytuple = NULL;
 	if (first_off > PageGetMaxOffsetNumber(page))
 		return NULL;
 
-	return _bt_mkscankey(rel,
-						 (IndexTuple) PageGetItem(page,
-												  PageGetItemId(page, first_off)));
+	*keytuple = CopyIndexTuple((IndexTuple) PageGetItem(page, PageGetItemId(page, first_off)));
+
+	return _bt_mkscankey(rel, *keytuple);
 }
 
 /*
@@ -164,6 +164,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 	BTScanInsert scankey;
 	BTMergeState mstate;
 	BTStack		stack;
+	IndexTuple      keytuple;
 
 	mstate.rel = rel;
 	mstate.min_threshold = min_threshold / 100.0;
@@ -238,7 +239,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		num_pages++;
 		current_blkno = right_blkno;
 
-		scankey = _bt_merge_mkscankey(rel, leftpage, leftopaque);
+		scankey = _bt_merge_mkscankey(rel, leftpage, leftopaque, &keytuple);
 
 		if (_bt_pages_mergeable(leftpage, rightpage,
 								mstate.min_threshold, mstate.fillfactor) &&
@@ -277,6 +278,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 			}
 
 			pfree(scankey);
+			pfree(keytuple);
 			continue;
 		}
 
@@ -284,7 +286,10 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 		UnlockReleaseBuffer(rightbuf);
 		UnlockReleaseBuffer(leftbuf);
 		if (scankey)
+		{
 			pfree(scankey);
+			pfree(keytuple);
+		}
 	}
 }
 
