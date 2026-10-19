@@ -858,6 +858,7 @@ btinitparallelscan(void *target)
 	bt_target->btps_nextScanPage = InvalidBlockNumber;
 	bt_target->btps_lastCurrPage = InvalidBlockNumber;
 	bt_target->btps_pageStatus = BTPARALLEL_NOT_INITIALIZED;
+	bt_target->btps_skipMABlkno = InvalidBlockNumber;
 	ConditionVariableInit(&bt_target->btps_cv);
 }
 
@@ -884,6 +885,7 @@ btparallelrescan(IndexScanDesc scan)
 	btscan->btps_nextScanPage = InvalidBlockNumber;
 	btscan->btps_lastCurrPage = InvalidBlockNumber;
 	btscan->btps_pageStatus = BTPARALLEL_NOT_INITIALIZED;
+	btscan->btps_skipMABlkno = InvalidBlockNumber;
 	LWLockRelease(&btscan->btps_lock);
 }
 
@@ -943,7 +945,6 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 		so->needPrimScan = false;
 		so->scanBehind = false;
 		so->oppositeDirCheck = false;
-		btscan->btps_skipMABlkno = InvalidBlockNumber;
 	}
 	else
 	{
