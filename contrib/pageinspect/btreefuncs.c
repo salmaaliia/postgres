@@ -1077,12 +1077,18 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		 */
 		{
 			Buffer		endpoint_buf = _bt_get_endpoint(rel, 0, false);
-			Page		temp_page = BufferGetPage(endpoint_buf);
-			BTPageOpaque temp_opaque = BTPageGetOpaque(temp_page);
 
-			uargs->current_blkno = temp_opaque->btpo_next;
-			/* elog(WARNING, "Hello from bt_find_merge_candidates"); */
-			UnlockReleaseBuffer(endpoint_buf);
+			if (BufferIsValid(endpoint_buf))
+			{
+				Page		temp_page = BufferGetPage(endpoint_buf);
+				BTPageOpaque temp_opaque = BTPageGetOpaque(temp_page);
+
+				uargs->current_blkno = temp_opaque->btpo_next;
+				/* elog(WARNING, "Hello from bt_find_merge_candidates"); */
+				UnlockReleaseBuffer(endpoint_buf);
+			}
+			else
+				uargs->current_blkno = P_NONE;
 		}
 
 		uargs->relid = RelationGetRelid(rel);

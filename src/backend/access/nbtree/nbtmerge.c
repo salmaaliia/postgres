@@ -173,6 +173,9 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 	{
 		Buffer		endpoint_buf = _bt_get_endpoint(rel, 0, false);
 
+		if (BufferIsInvalid(endpoint_buf))
+			return 0;
+
 		current_blkno = BufferGetBlockNumber(endpoint_buf);
 		temp_page = BufferGetPage(endpoint_buf);
 		temp_opaque = BTPageGetOpaque(temp_page);
