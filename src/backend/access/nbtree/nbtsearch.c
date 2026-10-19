@@ -1781,6 +1781,7 @@ _bt_readfirstpage(IndexScanDesc scan, OffsetNumber offnum, ScanDirection dir)
 		{
 			so->skipMergeRecovery = true;
 			so->mergedAwayBlkno = BTMergedPageGetMABlkno(page);
+			_bt_parallel_set_skip_ma(scan, so->mergedAwayBlkno);
 		}
 	}
 
