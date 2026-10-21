@@ -46,7 +46,8 @@ static bool _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 static Buffer _bt_lock_and_validate_left(Relation rel, BlockNumber *blkno,
 										 BlockNumber lastcurrblkno);
 static bool _bt_endpoint(IndexScanDesc scan, ScanDirection dir);
-static void _bt_find_merge_tail(IndexScanDesc scan, BlockNumber m_blkno, BlockNumber *blkno,
+static void _bt_find_merge_tail(IndexScanDesc scan, BlockNumber ma_blkno,
+								BlockNumber m_blkno, BlockNumber *blkno,
 								BlockNumber *lastcurrblkno);
 static void _bt_load_boundary_from_ma(IndexScanDesc scan, Buffer mabuf);
 
@@ -2160,7 +2161,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 
 		if (needMergeRecoverWalk)
 		{
-			_bt_find_merge_tail(scan, m_blkno, &blkno, &lastcurrblkno);
+			_bt_find_merge_tail(scan, blkno, m_blkno, &blkno, &lastcurrblkno);
 
 			/*
 			 * After this call the loop will continue to read blkno page * so
@@ -2227,18 +2228,25 @@ _bt_load_boundary_from_ma(IndexScanDesc scan, Buffer mabuf)
  * needed so the backward scan can restart from the tail and walk backward
  * through the full merge group, deduplicating against savedMergeTids.
  *
- * m_blkno is the block number of the first MERGED page (the immediate right
- * sibling of the MERGED_AWAY tombstone).  On return, *blkno is set to the
+ * ma_blkno is the MERGED_AWAY tombstone and m_blkno is its right sibling,
+ * normally the first MERGED page.  On return, *blkno is set to the
  * tail of the merge group (the last consecutive MERGED page), and
  * *lastcurrblkno is set to its right neighbor (the first non-MERGED page),
  * which is used as the right anchor for split validation during the
  * subsequent backward scan.
  *
+ * VACUUM can page-delete every merged page of a group while the tombstone
+ * stays, so m_blkno may not be one of the tombstone's merged pages.  Then
+ * there is nothing to recover: *blkno is set to the tombstone itself and
+ * *lastcurrblkno to m_blkno, and the caller steps past the tombstone since
+ * needMergeRecovery is already set.
+ *
  * Uses lock-coupling (acquire right, release left) to traverse the chain
  * safely under concurrent activity.
  */
 static void
-_bt_find_merge_tail(IndexScanDesc scan, BlockNumber m_blkno, BlockNumber *blkno,
+_bt_find_merge_tail(IndexScanDesc scan, BlockNumber ma_blkno,
+					BlockNumber m_blkno, BlockNumber *blkno,
 					BlockNumber *lastcurrblkno)
 {
 	Relation	rel = scan->indexRelation;
@@ -2262,7 +2270,13 @@ _bt_find_merge_tail(IndexScanDesc scan, BlockNumber m_blkno, BlockNumber *blkno,
 	l_page = BufferGetPage(l_buf);
 	l_opaque = BTPageGetOpaque(l_page);
 
-	Assert(P_ISMERGED(l_opaque));
+	if (!BTPageIsMergedMember(l_opaque, l_page, ma_blkno))
+	{
+		*blkno = ma_blkno;
+		*lastcurrblkno = m_blkno;
+		_bt_relbuf(rel, l_buf);
+		return;
+	}
 
 	/*
 	 * Step 2: Lock-couple rightward to find the boundary. Loop till we find a
