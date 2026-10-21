@@ -2114,6 +2114,7 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	IndexTuple	itup;
 	IndexTupleData trunctuple;
 	XLogRecPtr	recptr;
+	BlockNumber mablkno;
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
@@ -2244,6 +2245,7 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
 	opaque->btpo_flags |= BTP_HALF_DEAD;
+	mablkno = P_ISMERGED(opaque) ? BTMergedPageGetMABlkno(page) : InvalidBlockNumber;
 
 	Assert(PageGetMaxOffsetNumber(page) == P_HIKEY);
 	MemSet(&trunctuple, 0, sizeof(IndexTupleData));
@@ -2271,6 +2273,8 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 			xlrec.topparent = topparent;
 		else
 			xlrec.topparent = InvalidBlockNumber;
+
+		xlrec.merged_ma_blkno = mablkno;
 
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, leafbuf, REGBUF_WILL_INIT);
@@ -2350,9 +2354,12 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	IndexTuple	leafhikey;
 	BlockNumber leaftopparent;
 	XLogRecPtr	recptr;
+	BlockNumber mablkno;
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
+
+	mablkno = P_ISMERGED(opaque) ? BTMergedPageGetMABlkno(page) : InvalidBlockNumber;
 
 	Assert(P_ISLEAF(opaque) && !P_ISDELETED(opaque) && P_ISHALFDEAD(opaque));
 
@@ -2717,6 +2724,8 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 		xlrec.leafleftsib = leafleftsib;
 		xlrec.leafrightsib = leafrightsib;
 		xlrec.leaftopparent = leaftopparent;
+
+		xlrec.merged_ma_blkno = mablkno;
 
 		XLogRegisterData(&xlrec, SizeOfBtreeUnlinkPage);
 

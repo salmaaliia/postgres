@@ -258,7 +258,7 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 	BlockNumber origpagenumber;
 	BlockNumber rightpagenumber;
 	BlockNumber spagenumber;
-	BlockNumber	merge_ma_blkno = xlrec->merged_ma_blkno;
+	BlockNumber	merged_ma_blkno = xlrec->merged_ma_blkno;
 
 	XLogRecGetBlockTag(record, 0, NULL, NULL, &origpagenumber);
 	XLogRecGetBlockTag(record, 1, NULL, NULL, &rightpagenumber);
@@ -295,9 +295,9 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 	ropaque->btpo_flags = isleaf ? BTP_LEAF : 0;
 	ropaque->btpo_cycleid = 0;
 
-	if(merge_ma_blkno != InvalidBlockNumber){
+	if(BlockNumberIsValid(merged_ma_blkno)){
 		ropaque->btpo_flags |= BTP_MERGED;
-		BTMergedPageSetMABlkno(rpage, merge_ma_blkno);
+		BTMergedPageSetMABlkno(rpage, merged_ma_blkno);
 	}
 
 	_bt_restore_page(rpage, datapos, datalen);
@@ -422,9 +422,9 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 		if (isleaf)
 			oopaque->btpo_flags |= BTP_LEAF;
 
-		if(merge_ma_blkno != InvalidBlockNumber){
+		if(BlockNumberIsValid(merged_ma_blkno)){
 			oopaque->btpo_flags |= BTP_MERGED;
-			BTMergedPageSetMABlkno(origpage, merge_ma_blkno);
+			BTMergedPageSetMABlkno(origpage, merged_ma_blkno);
 		}
 
 		oopaque->btpo_next = rightpagenumber;
@@ -499,7 +499,7 @@ btree_xlog_dedup(XLogReaderState *record)
 		maxoff = PageGetMaxOffsetNumber(page);
 		newpage = PageGetTempPageCopySpecial(page);
 
-		if (xlrec->merged_ma_blkno != InvalidBlockNumber)
+		if (BlockNumberIsValid(xlrec->merged_ma_blkno))
 		{
 			BTPageOpaque nopaque = BTPageGetOpaque(newpage);
 			nopaque->btpo_flags |= BTP_MERGED;
@@ -729,6 +729,7 @@ btree_xlog_mark_page_halfdead(uint8 info, XLogReaderState *record)
 	Page		page;
 	BTPageOpaque pageop;
 	IndexTupleData trunctuple;
+	BlockNumber	merged_ma_blkno = xlrec->merged_ma_blkno;
 
 	/*
 	 * In normal operation, we would lock all the pages this WAL record
@@ -787,6 +788,12 @@ btree_xlog_mark_page_halfdead(uint8 info, XLogReaderState *record)
 	pageop->btpo_flags = BTP_HALF_DEAD | BTP_LEAF;
 	pageop->btpo_cycleid = 0;
 
+	if (BlockNumberIsValid(merged_ma_blkno))
+	{
+		pageop->btpo_flags |= BTP_MERGED;
+		BTMergedPageSetMABlkno(page, merged_ma_blkno);
+	}
+
 	/*
 	 * Construct a dummy high key item that points to top parent page (value
 	 * is InvalidBlockNumber when the top parent page is the leaf page itself)
@@ -819,6 +826,7 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 	Buffer		rightbuf;
 	Page		page;
 	BTPageOpaque pageop;
+	BlockNumber	merged_ma_blkno = xlrec->merged_ma_blkno;
 
 	leftsib = xlrec->leftsib;
 	rightsib = xlrec->rightsib;
@@ -867,6 +875,12 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 	if (isleaf)
 		pageop->btpo_flags |= BTP_LEAF;
 	pageop->btpo_cycleid = 0;
+
+	if (isleaf && BlockNumberIsValid(merged_ma_blkno))
+	{
+		pageop->btpo_flags |= BTP_MERGED;
+		BTMergedPageSetMABlkno(page, merged_ma_blkno);
+	}
 
 	PageSetLSN(page, lsn);
 	MarkBufferDirty(target);
@@ -923,6 +937,12 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 		pageop->btpo_next = xlrec->leafrightsib;
 		pageop->btpo_level = 0;
 		pageop->btpo_cycleid = 0;
+
+		if (BlockNumberIsValid(merged_ma_blkno))
+		{
+			pageop->btpo_flags |= BTP_MERGED;
+			BTMergedPageSetMABlkno(page, merged_ma_blkno);
+		}
 
 		/* Add a dummy hikey item */
 		MemSet(&trunctuple, 0, sizeof(IndexTupleData));

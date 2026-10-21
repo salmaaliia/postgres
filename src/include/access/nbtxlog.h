@@ -300,9 +300,10 @@ typedef struct xl_btree_mark_page_halfdead
 	BlockNumber leftblk;		/* leaf block's left sibling, if any */
 	BlockNumber rightblk;		/* leaf block's right sibling */
 	BlockNumber topparent;		/* topmost internal page in the subtree */
+	BlockNumber merged_ma_blkno;  /* leaf's MA block if leaf is M, else InvalidBlockNumber */
 } xl_btree_mark_page_halfdead;
 
-#define SizeOfBtreeMarkPageHalfDead (offsetof(xl_btree_mark_page_halfdead, topparent) + sizeof(BlockNumber))
+#define SizeOfBtreeMarkPageHalfDead (offsetof(xl_btree_mark_page_halfdead, merged_ma_blkno) + sizeof(BlockNumber))
 
 /*
  * This is what we need to know about deletion of a btree page.  Note that we
@@ -335,11 +336,12 @@ typedef struct xl_btree_unlink_page
 	BlockNumber leafleftsib;
 	BlockNumber leafrightsib;
 	BlockNumber leaftopparent;	/* next child down in the subtree */
+	BlockNumber merged_ma_blkno;  /* leaf's MA block if leaf is M, else InvalidBlockNumber */
 
 	/* xl_btree_metadata FOLLOWS IF XLOG_BTREE_UNLINK_PAGE_META */
 } xl_btree_unlink_page;
 
-#define SizeOfBtreeUnlinkPage	(offsetof(xl_btree_unlink_page, leaftopparent) + sizeof(BlockNumber))
+#define SizeOfBtreeUnlinkPage	(offsetof(xl_btree_unlink_page, merged_ma_blkno) + sizeof(BlockNumber))
 
 /*
  * New root log record.  There are zero tuples if this is to establish an
