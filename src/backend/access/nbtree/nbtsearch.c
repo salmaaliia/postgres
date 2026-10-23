@@ -2108,7 +2108,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 				
 				if (MASkiped)
 				{
-					/* L was skipped as a  tombstone; read all data on this page */
+					/* L was skipped as a tombstone; read all data on this page */
 					so->needMergeRecovery = false;
 				}
 				else
@@ -2135,6 +2135,12 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 
 						so->mergedAwayBlkno = MABlkno;
 					}
+					/*
+ 					 * The boundary may already be cached from an earlier visit to this
+ 					 * group, e.g. after a mark/restore, so turn the filter on here rather
+ 					 * than only when loading it.
+ 					 */
+					so->needMergeRecovery = true;
 				}
 				if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque), seized))
 					break;
