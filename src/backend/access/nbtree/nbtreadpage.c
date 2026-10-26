@@ -173,6 +173,8 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 				ignore_killed_tuples = scan->ignore_killed_tuples;
 	int			itemIndex,
 				indnatts;
+	bool		mergeFiltered;
+	int			startIndex = -1;	/* first item to return, if mergeFiltered */
 
 	/* save the page/buffer block number, along with its sibling links */
 	page = BufferGetPage(so->currPos.buf);
@@ -183,6 +185,9 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 	/* delay setting so->currPos.lsn until _bt_drop_lock_and_maybe_pin */
 	pstate.dir = so->currPos.dir = dir;
 	so->currPos.nextTupleOffset = 0;
+
+	mergeFiltered = P_ISMERGED(opaque) && so->needMergeRecovery;
+	so->currPos.mergeFiltered = mergeFiltered;
 
 	/* either moreRight or moreLeft should be set now (may be unset later) */
 	Assert(ScanDirectionIsForward(dir) ? so->currPos.moreRight :
@@ -304,20 +309,16 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 
 			if (passes_quals)
 			{
-				int posStart	= 0;
-				int cmp;
-
 				if(P_ISMERGED(opaque) && so->needMergeRecovery)
 				{
+					int cmp;
+
 					Assert(so->mergeBoundaryKey != NULL);
 					cmp = _bt_compare(rel, so->mergeBoundaryKey, page, offnum);
 
-					if (cmp > 0)
-					{
-						offnum = OffsetNumberNext(offnum);
-						continue;
-					}
-					else if (cmp == 0)
+					/* cmp > 0 is a tuple from L: save it for a direction turn, but don't start there */
+
+					if (cmp == 0)
 					{
 						if(!BTreeTupleIsPosting(itup))
 						{
@@ -325,23 +326,24 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 							so->needMergeRecovery = false;
 							_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
 
-							offnum = OffsetNumberNext(offnum);
-							continue;
+							startIndex = itemIndex + 1;
 						}
-
-						posStart = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
-						if(posStart >= BTreeTupleGetNPosting(itup))
+						else
 						{
-							/* All TIDs in this list were from L -> skip whole tuple */
-							offnum = OffsetNumberNext(offnum);
-							continue;
-						}
+							int posStart = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
 
-						/* Crossed the boundary! Shut off recovery */
-						so->needMergeRecovery = false;
-						_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
+							if(posStart < BTreeTupleGetNPosting(itup))
+							{
+								/* Crossed the boundary! Shut off recovery */
+								so->needMergeRecovery = false;
+								_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
+								startIndex = itemIndex + posStart;
+							}
+
+						}
 					}
-					else {
+					else if (cmp < 0)
+					{
 
 						/*
 						 * Boundary < Tuple: this tuple is strictly after the boundary.
@@ -350,6 +352,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 						 */
 						so->needMergeRecovery = false;
 						_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
+						startIndex = itemIndex;
 					}
 				}
 				
@@ -367,12 +370,12 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 					/* Set up posting list state (and remember first TID) */
 					tupleOffset =
 						_bt_setuppostingitems(so, itemIndex, offnum,
-											  BTreeTupleGetPostingN(itup, posStart),
+											  BTreeTupleGetPostingN(itup, 0),
 											  itup);
 					itemIndex++;
 
 					/* Remember all later TIDs (must be at least one) */
-					for (int i = posStart + 1; i < BTreeTupleGetNPosting(itup); i++)
+					for (int i = 1; i < BTreeTupleGetNPosting(itup); i++)
 					{
 						_bt_savepostingitem(so, itemIndex, offnum,
 											BTreeTupleGetPostingN(itup, i),
@@ -422,6 +425,13 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 		so->currPos.firstItem = 0;
 		so->currPos.lastItem = itemIndex - 1;
 		so->currPos.itemIndex = 0;
+
+		if (mergeFiltered)
+		{
+			if (startIndex < 0 || startIndex > so->currPos.lastItem)
+				return false;
+			so->currPos.itemIndex = startIndex;
+		}
 	}
 	else
 	{
@@ -538,10 +548,9 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 
 			if (passes_quals && tuple_alive)
 			{
-				int posEnd = BTreeTupleIsPosting(itup) ? BTreeTupleGetNPosting(itup) : 0;
 				int cmp;
 
-				if(P_ISMERGED(opaque) && so->needMergeRecovery)
+				if(P_ISMERGED(opaque) && so->needMergeRecovery && startIndex < 0)
 				{
 					Assert(so->mergeBoundaryKey != NULL);
 
@@ -549,26 +558,19 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 
 					if(cmp < 0)
 					{
-						/*
-						 * Boundary < Tuple: tuple is strictly > boundary (belonged to R).
-						 * Backward scan was reading R before the merge -> skip duplicate.
-						 */
-						offnum = OffsetNumberPrev(offnum);
-						continue;
+						/* Tuple from R: save it for a direction turn, but don't start there */
 					}
-					else if ( cmp == 0)
+					else if ( cmp == 0 && BTreeTupleIsPosting(itup))
 					{
-						if(BTreeTupleIsPosting(itup))
-						{
-							posEnd = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
-							if(posEnd <= 0)
-							{
-								offnum = OffsetNumberPrev(offnum);
-								continue;
-							}
-
-						}
-
+						/* TIDs before nfromL came from L */
+						int nfromL = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
+						if(nfromL > 0)
+							startIndex = itemIndex - (BTreeTupleGetNPosting(itup) - nfromL + 1);
+					}
+					else
+					{
+						/* Last tuple from L */
+						startIndex = itemIndex - 1;
 					}
 				}
 
@@ -581,18 +583,18 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 				}
 				else
 				{
-					// uint16		nitems = BTreeTupleGetNPosting(itup);
+					uint16		nitems = BTreeTupleGetNPosting(itup);
 					int			tupleOffset;
 
 					/* Set up posting list state (and remember last TID) */
 					itemIndex--;
 					tupleOffset =
 						_bt_setuppostingitems(so, itemIndex, offnum,
-											  BTreeTupleGetPostingN(itup, posEnd - 1),
+											  BTreeTupleGetPostingN(itup, nitems - 1),
 											  itup);
 
 					/* Remember all prior TIDs (must be at least one) */
-					for (int i = posEnd - 2; i >= 0; i--)
+					for (int i = nitems - 2; i >= 0; i--)
 					{
 						itemIndex--;
 						_bt_savepostingitem(so, itemIndex, offnum,
@@ -619,6 +621,13 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 		so->currPos.firstItem = itemIndex;
 		so->currPos.lastItem = MaxTIDsPerBTreePage - 1;
 		so->currPos.itemIndex = MaxTIDsPerBTreePage - 1;
+
+		if (mergeFiltered)
+		{
+			if (startIndex < 0)
+				return false;
+			so->currPos.itemIndex = startIndex;
+		}
 	}
 
 	/*

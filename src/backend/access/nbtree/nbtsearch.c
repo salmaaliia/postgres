@@ -1721,6 +1721,17 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 
 	BTScanPosUnpinIfPinned(so->currPos);
 
+	/*
+	 * The scan turned on a merge-filtered copy.  The other merged pages in
+	 * the new direction are all on the far side of the cursor, so read them
+	 * in full and skip the tombstone.
+	 */
+	if (so->currPos.mergeFiltered && so->currPos.dir != dir)
+	{
+		so->needMergeRecovery = false;
+		so->skipMergeRecovery = true;
+	}
+
 	/* Walk to the next page with data */
 	if (ScanDirectionIsForward(dir))
 		blkno = so->currPos.nextPage;

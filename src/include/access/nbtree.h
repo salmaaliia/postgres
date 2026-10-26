@@ -1093,6 +1093,13 @@ typedef struct BTScanPosData
 	bool		moreRight;
 
 	/*
+	 * Set when _bt_readpage read a merged page with the merge filter on.
+	 * items[] then holds every matching tuple, and itemIndex starts at the
+	 * merge boundary.
+	 */
+	bool		mergeFiltered;
+
+	/*
 	 * The items array is always ordered in index order (ie, increasing
 	 * indexoffset).  When scanning backwards it is convenient to fill the
 	 * array back-to-front, so we start at the last slot and fill downwards.
