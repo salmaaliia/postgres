@@ -1052,8 +1052,12 @@ btree_xlog_merge_page(XLogReaderState *record)
 	char	   *boundary_pivot;
 	Size		boundary_sz;
 
-	/* Reconstruct left (MA) page from scratch */
-	buf = XLogInitBufferForRedo(record, 0);
+    /*
+     * Reconstruct left (MA) page from scratch.  Take a cleanup lock, as the
+     * merge did on the primary, so a standby scan that still holds L's items
+     * forces a recovery conflict instead of losing them.
+     */
+	XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_CLEANUP_LOCK, true, &buf);
 	page = BufferGetPage(buf);
 
 	_bt_pageinit(page, BufferGetPageSize(buf));
