@@ -1033,6 +1033,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 	Size		left_used,
 				right_used;
 	BTScanInsert scankey;
+	IndexTuple	keytuple = NULL;
 	int			j;
 	Datum		values[5];
 	bool		nulls[5];
@@ -1191,7 +1192,9 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 					IndexTuple	first_itup = (IndexTuple) PageGetItem(leftpage,
 																	  PageGetItemId(leftpage, first_data_off));
 
-					scankey = _bt_mkscankey(rel, first_itup);
+					/* The key must not point into L's buffer, which is released below */
+					keytuple = CopyIndexTuple(first_itup);
+					scankey = _bt_mkscankey(rel, keytuple);
 				}
 			}
 
@@ -1222,13 +1225,17 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 					_bt_pages_share_parent(rel, left_blkno, right_blkno, scankey, NULL))
 				{
 					pfree(scankey);
+					pfree(keytuple);
 					relation_close(rel, AccessShareLock);
 					break;		/* found a valid candidate */
 				}
 			}
 
 			if (scankey)
+			{
 				pfree(scankey);
+				pfree(keytuple);
+			}
 		}
 	}
 
@@ -1386,8 +1393,9 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 							errmsg("leaf page %u is empty cannot determine parent",
 								   left_blkno)));
 
-		first_itup = (IndexTuple) PageGetItem(
-											  leftpage, PageGetItemId(leftpage, first_data_off));
+		/* Copy it: the key must not point into L's buffer after the release */
+		first_itup = CopyIndexTuple((IndexTuple) PageGetItem(
+											  leftpage, PageGetItemId(leftpage, first_data_off)));
 
 		/*
 		 * Build a typed scan key from the tuple using the relation schema.
@@ -1414,6 +1422,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		if (stack != NULL)
 			_bt_freestack(stack);
 		pfree(scankey);
+		pfree(first_itup);
 
 		if (parent_blkno == InvalidBlockNumber)
 			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),

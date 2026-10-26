@@ -3187,6 +3187,14 @@ _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 
 	maxoff = PageGetMaxOffsetNumber(parentpage);
 
+	/* The parent may have changed since the descent */
+	if (left_off < P_FIRSTDATAKEY(BTPageGetOpaque(parentpage)) || left_off > maxoff)
+	{
+		UnlockReleaseBuffer(parentbuf);
+		_bt_freestack(stack);
+		return false;
+	}
+
 	itup = (IndexTuple) PageGetItem(parentpage, PageGetItemId(parentpage, left_off));
 
 	child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
