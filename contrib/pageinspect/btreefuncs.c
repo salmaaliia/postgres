@@ -1719,7 +1719,7 @@ bt_merge(PG_FUNCTION_ARGS)
 				 errhint("bt_merge() cannot be executed during recovery.")));
 
 	relrv = makeRangeVarFromNameList(textToQualifiedNameList(relname));
-	rel = relation_openrv(relrv, AccessShareLock);
+	rel = relation_openrv(relrv, RowExclusiveLock);
 
 	if (!IS_INDEX(rel) || !IS_BTREE(rel))
 		ereport(ERROR,
@@ -1740,7 +1740,7 @@ bt_merge(PG_FUNCTION_ARGS)
 
 	merges_performed = _bt_merge_index(rel, merge_candidate_max_pct, merge_destination_max_pct, num_pages);
 
-	relation_close(rel, AccessShareLock);
+	relation_close(rel, NoLock);
 
 
 	PG_RETURN_INT32(merges_performed);
