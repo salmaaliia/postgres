@@ -1100,6 +1100,14 @@ typedef struct BTScanPosData
 	bool		mergeFiltered;
 
 	/*
+	 * Merge state of the scan at this page.  Kept here so mark/restore saves
+	 * and restores it together with the page.
+	 */
+	bool		needMergeRecovery;
+	bool		skipMergeRecovery;
+	BlockNumber mergedAwayBlkno;	/* blkno of L (BTP_MERGED_AWAY page) */
+
+	/*
 	 * The items array is always ordered in index order (ie, increasing
 	 * indexoffset).  When scanning backwards it is convenient to fill the
 	 * array back-to-front, so we start at the last slot and fill downwards.
@@ -1208,13 +1216,15 @@ typedef struct BTScanOpaqueData
 	BTScanPosData markPos;		/* marked position, if any */
 
 	/* Merge information */
-	bool		skipMergeRecovery;
-	bool		needMergeRecovery;
-
-	BlockNumber mergedAwayBlkno;	/* blkno of L (BTP_MERGED_AWAY page) */
-	
 	BTScanInsert    mergeBoundaryKey;     /* Pre-built insertion scan key */ 
 	IndexTuple      mergeBoundaryItup;
+	BlockNumber mergeBoundaryBlkno; /* L the boundary key was loaded from */
+
+	/*
+	 * Copy of the boundary taken with markPos, because the key above may
+	 * change before the mark is restored.
+	 */
+	IndexTuple	markBoundaryItup;
 
 } BTScanOpaqueData;
 

@@ -186,7 +186,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 	pstate.dir = so->currPos.dir = dir;
 	so->currPos.nextTupleOffset = 0;
 
-	mergeFiltered = P_ISMERGED(opaque) && so->needMergeRecovery;
+	mergeFiltered = P_ISMERGED(opaque) && so->currPos.needMergeRecovery;
 	so->currPos.mergeFiltered = mergeFiltered;
 
 	/* either moreRight or moreLeft should be set now (may be unset later) */
@@ -223,7 +223,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 		if (ScanDirectionIsForward(dir))
 			_bt_parallel_release(scan, so->currPos.nextPage,
 								 so->currPos.currPage);
-		else if(!so->needMergeRecovery)
+		else if(!so->currPos.needMergeRecovery)
 			_bt_parallel_release(scan, so->currPos.prevPage,
 								 so->currPos.currPage);
 	}
@@ -309,7 +309,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 
 			if (passes_quals)
 			{
-				if(P_ISMERGED(opaque) && so->needMergeRecovery)
+				if(P_ISMERGED(opaque) && so->currPos.needMergeRecovery)
 				{
 					int cmp;
 
@@ -323,7 +323,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 						if(!BTreeTupleIsPosting(itup))
 						{
 							/* Crossed the boundary! Shut off recovery */
-							so->needMergeRecovery = false;
+							so->currPos.needMergeRecovery = false;
 							_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
 
 							startIndex = itemIndex + 1;
@@ -335,7 +335,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 							if(posStart < BTreeTupleGetNPosting(itup))
 							{
 								/* Crossed the boundary! Shut off recovery */
-								so->needMergeRecovery = false;
+								so->currPos.needMergeRecovery = false;
 								_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
 								startIndex = itemIndex + posStart;
 							}
@@ -350,7 +350,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 						 * Belongs to R; forward scan has not seen it yet. Keep whole tuple
 						 * and shut off recovery
 						 */
-						so->needMergeRecovery = false;
+						so->currPos.needMergeRecovery = false;
 						_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
 						startIndex = itemIndex;
 					}
@@ -550,7 +550,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 			{
 				int cmp;
 
-				if(P_ISMERGED(opaque) && so->needMergeRecovery && startIndex < 0)
+				if(P_ISMERGED(opaque) && so->currPos.needMergeRecovery && startIndex < 0)
 				{
 					Assert(so->mergeBoundaryKey != NULL);
 

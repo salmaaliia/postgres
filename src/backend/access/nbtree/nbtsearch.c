@@ -1691,6 +1691,18 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 		so->markPos.itemIndex = so->markItemIndex;
 		so->markItemIndex = -1;
 
+		/* Save the boundary too, for btrestrpos to rebuild if it changes */
+		if (so->markBoundaryItup)
+		{
+			pfree(so->markBoundaryItup);
+			so->markBoundaryItup = NULL;
+		}
+		if (so->currPos.needMergeRecovery)
+		{
+			Assert(so->mergeBoundaryItup != NULL);
+			so->markBoundaryItup = CopyIndexTuple(so->mergeBoundaryItup);
+		}
+
 		/*
 		 * If we're just about to start the next primitive index scan
 		 * (possible with a scan that has arrays keys, and needs to skip to
@@ -1728,8 +1740,8 @@ _bt_steppage(IndexScanDesc scan, ScanDirection dir)
 	 */
 	if (so->currPos.mergeFiltered && so->currPos.dir != dir)
 	{
-		so->needMergeRecovery = false;
-		so->skipMergeRecovery = true;
+		so->currPos.needMergeRecovery = false;
+		so->currPos.skipMergeRecovery = true;
 	}
 
 	/* Walk to the next page with data */
@@ -1789,11 +1801,19 @@ _bt_readfirstpage(IndexScanDesc scan, OffsetNumber offnum, ScanDirection dir)
 		Page		page = BufferGetPage(so->currPos.buf);
 		BTPageOpaque opaque = BTPageGetOpaque(page);
 
+		/*
+		 * A new descent starts outside any merge group.  The scan may have
+		 * ended inside a group with recovery still on.
+		 */
+		so->currPos.needMergeRecovery = false;
+		so->currPos.skipMergeRecovery = false;
+		so->currPos.mergedAwayBlkno = InvalidBlockNumber;
+
 		if (P_ISMERGED(opaque))
 		{
-			so->skipMergeRecovery = true;
-			so->mergedAwayBlkno = BTMergedPageGetMABlkno(page);
-			_bt_parallel_set_skip_ma(scan, so->mergedAwayBlkno);
+			so->currPos.skipMergeRecovery = true;
+			so->currPos.mergedAwayBlkno = BTMergedPageGetMABlkno(page);
+			_bt_parallel_set_skip_ma(scan, so->currPos.mergedAwayBlkno);
 		}
 	}
 
@@ -1944,7 +1964,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 
 		/* parallel scan must never actually visit so->currPos blkno */
 		if (!seized && scan->parallel_scan != NULL &&
-			!(ScanDirectionIsBackward(dir) && so->needMergeRecovery) &&
+			!(ScanDirectionIsBackward(dir) && so->currPos.needMergeRecovery) &&
 			!_bt_parallel_seize(scan, &blkno, &lastcurrblkno, false))
 		{
 			/* whole scan is now done (or another primitive scan required) */
@@ -1982,25 +2002,12 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 			/*
 			 * We landed on a normal page. If we were in a merge group, we
 			 * have now exited it. Clear the merge recovery flags so we are
-			 * ready for the next merge group.
+			 * ready for the next merge group.  Keep the boundary key, as a
+			 * restore to a mark inside the group may need it again.
 			 */
-			if (so->needMergeRecovery || so->skipMergeRecovery || so->mergeBoundaryKey != NULL)
-			{
-				so->needMergeRecovery = false;
-				so->skipMergeRecovery = false;
-				so->mergedAwayBlkno = InvalidBlockNumber;
-				if (so->mergeBoundaryKey)
-				{
-					pfree(so->mergeBoundaryKey);
-					so->mergeBoundaryKey = NULL;
-				}
-				if (so->mergeBoundaryItup)
-				{
-					pfree(so->mergeBoundaryItup);
-					so->mergeBoundaryItup = NULL;
-				}
-
-			}
+			so->currPos.needMergeRecovery = false;
+			so->currPos.skipMergeRecovery = false;
+			so->currPos.mergedAwayBlkno = InvalidBlockNumber;
 
 			/* see if there are any matches on this page */
 			if (ScanDirectionIsForward(dir))
@@ -2037,8 +2044,8 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 				* proceed to the next page
 				*/
 				_bt_parallel_set_skip_ma(scan, blkno);
-				so->skipMergeRecovery = true;
-				so->mergedAwayBlkno = blkno;
+				so->currPos.skipMergeRecovery = true;
+				so->currPos.mergedAwayBlkno = blkno;
 				
 				blkno = opaque->btpo_next;
 
@@ -2051,12 +2058,12 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 				if(scan->parallel_scan != NULL)
 					MRead = (_bt_parallel_get_skip_ma(scan) == blkno);
 				else
-					MRead = (so->skipMergeRecovery && so->mergedAwayBlkno == blkno);
+					MRead = (so->currPos.skipMergeRecovery && so->currPos.mergedAwayBlkno == blkno);
 
 				/*
 				 * BACKWARD SCAN: Tombstone (BTP_MERGED_AWAY)
 				 */
-				if (MRead || so->needMergeRecovery)
+				if (MRead || so->currPos.needMergeRecovery)
 				{
 					/**
 					 * We either already read the merged page or we just finished walking
@@ -2065,21 +2072,13 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 					 */
 					blkno = opaque->btpo_prev;
 
-					/* Clear the states since we are exiting the merge group */
-					so->skipMergeRecovery = false;
-					so->needMergeRecovery = false;
-					so->mergedAwayBlkno = InvalidBlockNumber;
-
-					if (so->mergeBoundaryKey)
-					{
-						pfree(so->mergeBoundaryKey);
-						so->mergeBoundaryKey = NULL;
-					}
-					if (so->mergeBoundaryItup)
-					{
-						pfree(so->mergeBoundaryItup);
-						so->mergeBoundaryItup = NULL;
-					}
+					/*
+					 * Clear the states since we are exiting the merge group.
+					 * Keep the boundary key for a restore into the group.
+					 */
+					so->currPos.skipMergeRecovery = false;
+					so->currPos.needMergeRecovery = false;
+					so->currPos.mergedAwayBlkno = InvalidBlockNumber;
 
 					if(scan->parallel_scan != NULL)
 						_bt_parallel_release(scan, blkno, lastcurrblkno);
@@ -2091,7 +2090,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 					 * yet! Enter recovery mode to find the merged tuples.
 					 */
 					_bt_load_boundary_from_ma(scan, so->currPos.buf);
-					so->mergedAwayBlkno = blkno;
+					so->currPos.mergedAwayBlkno = blkno;
 
 					if(scan->parallel_scan != NULL)
 						_bt_parallel_set_skip_ma(scan, blkno);
@@ -2115,16 +2114,16 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 				if(scan->parallel_scan != NULL)
 					MASkiped = (_bt_parallel_get_skip_ma(scan) == MABlkno);
 				else
-					MASkiped = (so->skipMergeRecovery && so->mergedAwayBlkno == MABlkno);
+					MASkiped = (so->currPos.skipMergeRecovery && so->currPos.mergedAwayBlkno == MABlkno);
 				
 				if (MASkiped)
 				{
 					/* L was skipped as a tombstone; read all data on this page */
-					so->needMergeRecovery = false;
+					so->currPos.needMergeRecovery = false;
 				}
 				else
 				{
-					bool	loadBoundary = (so->mergedAwayBlkno != MABlkno || so->mergeBoundaryKey == NULL);
+					bool	loadBoundary = (so->mergeBoundaryBlkno != MABlkno || so->mergeBoundaryKey == NULL);
 
 					if(loadBoundary)
 					{
@@ -2143,15 +2142,14 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 						page = BufferGetPage(so->currPos.buf);
 						opaque = BTPageGetOpaque(page);
 						Assert(!P_IGNORE(opaque));
-
-						so->mergedAwayBlkno = MABlkno;
 					}
+					so->currPos.mergedAwayBlkno = MABlkno;
 					/*
  					 * The boundary may already be cached from an earlier visit to this
  					 * group, e.g. after a mark/restore, so turn the filter on here rather
  					 * than only when loading it.
  					 */
-					so->needMergeRecovery = true;
+					so->currPos.needMergeRecovery = true;
 				}
 				if (_bt_readpage(scan, dir, P_FIRSTDATAKEY(opaque), seized))
 					break;
@@ -2159,11 +2157,11 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 			}
 			else
 			{
-				so->mergedAwayBlkno = BTMergedPageGetMABlkno(page);
-				_bt_parallel_set_skip_ma(scan, so->mergedAwayBlkno);
+				so->currPos.mergedAwayBlkno = BTMergedPageGetMABlkno(page);
+				_bt_parallel_set_skip_ma(scan, so->currPos.mergedAwayBlkno);
 
-				if(!so->needMergeRecovery)
-					so->skipMergeRecovery = true;
+				if(!so->currPos.needMergeRecovery)
+					so->currPos.skipMergeRecovery = true;
 
 				if (_bt_readpage(scan, dir, PageGetMaxOffsetNumber(page), seized))
 					break;
@@ -2232,8 +2230,9 @@ _bt_load_boundary_from_ma(IndexScanDesc scan, Buffer mabuf)
 
 	so->mergeBoundaryItup = CopyIndexTuple(itup);
     so->mergeBoundaryKey = _bt_mkscankey(scan->indexRelation, so->mergeBoundaryItup);
+	so->mergeBoundaryBlkno = BufferGetBlockNumber(mabuf);
 
-    so->needMergeRecovery = true;
+    so->currPos.needMergeRecovery = true;
 }
 
 /*

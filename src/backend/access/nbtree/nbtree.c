@@ -380,11 +380,13 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	so->currTuples = so->markTuples = NULL;
 
 	/* Initialize merge fields */
-	so->skipMergeRecovery = false;
-	so->needMergeRecovery = false;
-	so->mergedAwayBlkno = InvalidBlockNumber;
+	so->currPos.skipMergeRecovery = false;
+	so->currPos.needMergeRecovery = false;
+	so->currPos.mergedAwayBlkno = InvalidBlockNumber;
 	so->mergeBoundaryKey = NULL;
 	so->mergeBoundaryItup = NULL;
+	so->mergeBoundaryBlkno = InvalidBlockNumber;
+	so->markBoundaryItup = NULL;
 
 	scan->xs_itupdesc = RelationGetDescr(rel);
 
@@ -439,9 +441,9 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	BTScanPosUnpinIfPinned(so->markPos);
 	BTScanPosInvalidate(so->markPos);
 
-	so->skipMergeRecovery = false;
-	so->needMergeRecovery = false;
-	so->mergedAwayBlkno = InvalidBlockNumber;
+	so->currPos.skipMergeRecovery = false;
+	so->currPos.needMergeRecovery = false;
+	so->currPos.mergedAwayBlkno = InvalidBlockNumber;
 
 	if (so->mergeBoundaryKey)
 	{
@@ -452,6 +454,12 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	{
 		pfree(so->mergeBoundaryItup);
 		so->mergeBoundaryItup = NULL;
+	}
+	so->mergeBoundaryBlkno = InvalidBlockNumber;
+	if (so->markBoundaryItup)
+	{
+		pfree(so->markBoundaryItup);
+		so->markBoundaryItup = NULL;
 	}
 
 	/*
@@ -506,6 +514,11 @@ btendscan(IndexScanDesc scan)
 	{
 		pfree(so->mergeBoundaryItup);
 		so->mergeBoundaryItup = NULL;
+	}
+	if (so->markBoundaryItup)
+	{
+		pfree(so->markBoundaryItup);
+		so->markBoundaryItup = NULL;
 	}
 
 	/* Release storage */
@@ -594,6 +607,28 @@ btrestrpos(IndexScanDesc scan)
 			if (so->currTuples)
 				memcpy(so->currTuples, so->markTuples,
 					   so->markPos.nextTupleOffset);
+
+			/*
+			 * The marked page needs the boundary of its merge group, but the
+			 * scan may have loaded another group's boundary since the mark.
+			 * Rebuild it from the copy saved with the mark.
+			 */
+			if (so->currPos.needMergeRecovery &&
+				(so->mergeBoundaryKey == NULL ||
+				 so->mergeBoundaryBlkno != so->currPos.mergedAwayBlkno))
+			{
+				Assert(so->markBoundaryItup != NULL);
+
+				if (so->mergeBoundaryKey)
+					pfree(so->mergeBoundaryKey);
+				if (so->mergeBoundaryItup)
+					pfree(so->mergeBoundaryItup);
+
+				so->mergeBoundaryItup = CopyIndexTuple(so->markBoundaryItup);
+				so->mergeBoundaryKey = _bt_mkscankey(scan->indexRelation,
+													 so->mergeBoundaryItup);
+				so->mergeBoundaryBlkno = so->currPos.mergedAwayBlkno;
+			}
 			/* Reset the scan's array keys (see _bt_steppage for why) */
 			if (so->numArrayKeys)
 			{
@@ -1726,7 +1761,7 @@ backtrack:
 
 				if(RelationNeedsWAL(rel))
 				{
-					xl_btree_clear_m xlrec;
+					xl_btree_clear_m xlrec = {0};
 					xlrec.safemergexid = safemergexid;
 					xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
 
@@ -1799,7 +1834,7 @@ backtrack:
 
 			if(RelationNeedsWAL(rel))
 			{
-				xl_btree_mark_ma_hd xlrec;
+				xl_btree_mark_ma_hd xlrec = {0};
 				xlrec.left_prev = opaque->btpo_prev;
 				xlrec.left_next = opaque->btpo_next;
 				xlrec.safemergexid = safemergexid;
