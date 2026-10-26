@@ -22,6 +22,7 @@ use warnings FATAL => 'all';
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
+use Time::HiRes qw(usleep);
 
 my $node = PostgreSQL::Test::Cluster->new('primary');
 $node->init(allows_streaming => 1, has_archiving => 1);
@@ -216,24 +217,33 @@ sub run_concurrent_scan
 	cmp_ok($merges, '>', 0, "$name: merge happened while scan was paused");
 	$node->safe_psql('postgres', $post_sql) if $post_sql ne '';
 
-	# Wake up all waiting processes (in case multiple workers hit the injection point)
+	# Detach first, so the scan cannot stop there again (a backward scan can
+	# reach the same page twice).  Then wake every process still waiting,
+	# including parallel workers, until none has waited for a while.
 	$node->safe_psql('postgres', qq[
+		SELECT injection_points_detach('$inj_point');
 		DO \$\$
+		DECLARE
+			quiet int := 0;
 		BEGIN
-			FOR i IN 1..10 LOOP
-				EXIT WHEN NOT EXISTS (
+			FOR i IN 1..1000 LOOP
+				IF EXISTS (
 					SELECT 1 FROM pg_stat_activity
 					WHERE wait_event_type = 'InjectionPoint' AND wait_event = '$inj_point'
-				);
-				BEGIN
-					PERFORM injection_points_wakeup('$inj_point');
-				EXCEPTION
-					WHEN OTHERS THEN EXIT;
-				END;
+				) THEN
+					quiet := 0;
+					BEGIN
+						PERFORM injection_points_wakeup('$inj_point');
+					EXCEPTION
+						WHEN OTHERS THEN NULL;
+					END;
+				ELSE
+					quiet := quiet + 1;
+					EXIT WHEN quiet >= 10;
+				END IF;
 				PERFORM pg_sleep(0.01);
 			END LOOP;
 		END \$\$;
-		SELECT injection_points_detach('$inj_point');
 	]);
 
 	$h->finish();
@@ -519,6 +529,79 @@ for my $dir ('ASC', 'DESC')
 	}
 }
 
+# 6b: the cursor's bound stops the scan inside the merged page, where it
+# still filters the rows that came from the left page.  The scan then ends,
+# and the cursor turns around, which starts a new descent.  That descent
+# must not reuse the old merge state.  The bounds are inside the left page's
+# key range (4759..5124); the right page is 5125..5490.
+{
+	my $cur_setup = q{
+		DROP TABLE IF EXISTS merge_turn;
+		CREATE TABLE merge_turn (id int) WITH (autovacuum_enabled = off);
+		INSERT INTO merge_turn SELECT generate_series(1, 20000);
+		CREATE INDEX merge_turn_idx ON merge_turn (id);
+		DELETE FROM merge_turn WHERE id BETWEEN 4759 AND 5490 AND id % 20 <> 0
+			AND id NOT IN (4759, 5124, 5125, 5490);
+		VACUUM (FREEZE) merge_turn;
+	};
+	# Turn at the far end, or go back right after the merge.
+	my %orders = (
+		far => [ [ 1000, 'forward' ], [ 1000, 'backward' ], [ 1000, 'forward' ] ],
+		back => [ [ 1000, 'backward' ], [ 1000, 'forward' ], [ 1000, 'backward' ] ]);
+	my @cases;
+	for my $dir ('ASC', 'DESC')
+	{
+		for my $ios ('off', 'on')
+		{
+			for my $first (3, 20)
+			{
+				push @cases, [ $dir, $ios, $first, $_ ] for sort keys %orders;
+			}
+		}
+	}
+
+	my $merged = 0;
+	for my $case (@cases)
+	{
+		my ($dir, $ios, $first, $order) = @$case;
+		my @steps = @{ $orders{$order} };
+		my $q = "SELECT id FROM merge_turn WHERE id > 4900 AND id < 5491 ORDER BY id $dir";
+		my $name = "bounded cursor $dir, index-only $ios, merge after $first rows, turn $order";
+		$node->safe_psql('postgres', $cur_setup);
+		my $rows = ids_of($node, "$heap_prefix $q");
+		my @expected = simulate_fetches($rows, $first, @steps);
+
+		my $s = $node->background_psql('postgres');
+		$s->query_safe(qq{
+			BEGIN ISOLATION LEVEL REPEATABLE READ;
+			SET LOCAL enable_seqscan = off;
+			SET LOCAL enable_bitmapscan = off;
+			SET LOCAL enable_indexonlyscan = $ios;
+			SET LOCAL statement_timeout = '60s';
+			DECLARE c SCROLL CURSOR FOR $q;
+		});
+		is($s->query_safe("FETCH $first FROM c"),
+			join("\n", @$rows[ 0 .. $first - 1 ]),
+			"$name: first FETCH");
+		# An index-only scan pinning the left page makes the merge back off;
+		# the result must be right either way.
+		$merged++
+		  if $s->query_safe(
+			"SELECT bt_merge('merge_turn_idx', 10, 90, 1000)") > 0;
+		for my $i (0 .. $#steps)
+		{
+			my ($cnt, $way) = @{ $steps[$i] };
+			is($s->query_safe("FETCH $way $cnt FROM c"),
+				join("\n", @{ $expected[$i] }),
+				"$name: FETCH $way $cnt");
+		}
+		$s->query_safe('COMMIT');
+		$s->quit;
+		index_ok($node, 'merge_turn_idx', $name);
+	}
+	cmp_ok($merged, '>', 0, 'bounded cursor: merges happened');
+}
+
 # ==============================================================================
 # SECTION 7: merge join restores a mark after a merge
 # ==============================================================================
@@ -574,6 +657,217 @@ $node->safe_psql('postgres', q{
 	index_ok($node, 'merge_mj_idx', 'merge join');
 }
 
+# 7b: merge joins forward and backward, with a plain and an index-only inner
+# scan.  The outer side has duplicate keys on both sides of the merge
+# boundary, so the inner scan is marked on the left page or on the right
+# page.  The merge happens after every possible number of fetched rows.
+# When an index-only scan still pins the left page, the merge backs off; the
+# result must be right either way.
+{
+	my $mj2_setup = q{
+		DROP TABLE IF EXISTS merge_mj2;
+		CREATE TABLE merge_mj2 (id int) WITH (autovacuum_enabled = off);
+		INSERT INTO merge_mj2 SELECT generate_series(1, 20000);
+		CREATE INDEX merge_mj2_idx ON merge_mj2 (id);
+		DELETE FROM merge_mj2 WHERE id BETWEEN 4759 AND 5490 AND id % 20 <> 0
+			AND id NOT IN (4759, 5124, 5125, 5490);
+		VACUUM (FREEZE) merge_mj2;
+	};
+	$node->safe_psql('postgres', q{
+		CREATE TABLE merge_mj2_outer (k int);
+		INSERT INTO merge_mj2_outer VALUES (4700), (4760), (4760), (4780),
+			(5100), (5124), (5124), (5125), (5125), (5140), (5300), (5300),
+			(5491), (5491), (5600);
+		-- with statistics, the planner keeps the small table on the outer side
+		ANALYZE merge_mj2_outer;
+	});
+
+	for my $dir ('ASC', 'DESC')
+	{
+		for my $ios ('off', 'on')
+		{
+			my $name = "merge join $dir, index-only $ios";
+			my $join_sql = "SELECT m.id FROM merge_mj2_outer o JOIN merge_mj2 m ON m.id = o.k ORDER BY o.k $dir";
+			my $settings = qq{
+				SET LOCAL enable_hashjoin = off; SET LOCAL enable_nestloop = off;
+				SET LOCAL enable_material = off; SET LOCAL enable_seqscan = off;
+				SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexonlyscan = $ios;
+				SET LOCAL statement_timeout = '60s';
+			};
+
+			$node->safe_psql('postgres', $mj2_setup);
+			my $expected = ids_of($node, qq{
+				SET enable_indexscan = off; SET enable_indexonlyscan = off;
+				SET enable_bitmapscan = off; SET enable_mergejoin = off;
+				SET enable_nestloop = off;
+				SELECT id FROM ($join_sql) x ORDER BY id;
+			});
+			my $total = scalar(@$expected);
+			my $scan = $ios eq 'on' ? 'Index Only Scan' : 'Index Scan';
+			$scan .= ' Backward' if $dir eq 'DESC';
+			like(
+				$node->safe_psql('postgres',
+					"BEGIN; $settings EXPLAIN (COSTS OFF) DECLARE x CURSOR FOR $join_sql; COMMIT;"),
+				qr/Merge Join.*->\s+Sort.*->\s+\Q$scan\E using merge_mj2_idx/s,
+				"$name: the inner side is an \L$scan\E");
+
+			my $merged = 0;
+			for my $first (1 .. $total - 1)
+			{
+				$node->safe_psql('postgres', $mj2_setup) if $first > 1;
+				my $s = $node->background_psql('postgres');
+				$s->query_safe("BEGIN; $settings DECLARE c CURSOR FOR $join_sql;");
+				my @got = split /\n/, $s->query_safe("FETCH $first FROM c");
+				$merged++
+				  if $s->query_safe(
+					"SELECT bt_merge('merge_mj2_idx', 10, 90, 1000)") > 0;
+				my ($rest, $ret) = $s->query('FETCH ALL FROM c');
+				is($ret, 0, "$name, merge after $first rows: no error")
+				  or diag($s->{stderr});
+				push @got, split /\n/, $rest;
+				$s->query('COMMIT');
+				$s->quit;
+				is_deeply([ sort { $a <=> $b } @got ], $expected,
+					"$name, merge after $first rows: rows match a hash join");
+			}
+			cmp_ok($merged, '>', 0, "$name: merges happened");
+			index_ok($node, 'merge_mj2_idx', $name);
+		}
+	}
+}
+
+# 7c: the mark is taken on a filtered merged page, and the boundary changes
+# before the restore.  A DESC merge join reads the inner index on (k, s).
+# Group 1 (L1 merged into R1) holds the start of the k = 1 run, so the join
+# marks the inner scan on R1 while R1 is read with group 1's boundary.  R1 is
+# also split by invisible inserts, so the scan needs that boundary for more
+# than one page.  The k = 1 run continues left to group 2, which merges only
+# after the scan has passed its right page, so the scan loads group 2's
+# boundary.  When the second outer row restores the mark, group 1's boundary
+# must come back from the copy saved with the mark.
+{
+	my $mr_setup = q{
+		DROP TABLE IF EXISTS merge_mr;
+		DROP TABLE IF EXISTS merge_mr_outer;
+		CREATE TABLE merge_mr (k int, s int) WITH (autovacuum_enabled = off);
+		INSERT INTO merge_mr SELECT 0, s FROM generate_series(1, 400) s;
+		INSERT INTO merge_mr SELECT 1, s FROM generate_series(1, 4000) s;
+		INSERT INTO merge_mr SELECT 2, s FROM generate_series(1, 800) s;
+		INSERT INTO merge_mr SELECT 3, s FROM generate_series(1, 800) s;
+		CREATE INDEX merge_mr_idx ON merge_mr (k, s);
+		CREATE TABLE merge_mr_outer (k int);
+		INSERT INTO merge_mr_outer VALUES (3), (2), (1), (1);
+		ANALYZE merge_mr_outer;
+	};
+
+	# Leaf pages in key order, as [blkno, min k, min s, max k, max s].
+	my $leaves = sub {
+		my $out = $node->safe_psql('postgres', q{
+			WITH RECURSIVE chain(blkno, nxt, n) AS (
+				SELECT blkno, btpo_next, 0 FROM bt_multi_page_stats('merge_mr_idx', 1, -1)
+				 WHERE type = 'l' AND btpo_prev = 0
+				UNION ALL
+				SELECT p.blkno, p.btpo_next, c.n + 1 FROM chain c
+				  JOIN bt_multi_page_stats('merge_mr_idx', 1, -1) p ON p.blkno = c.nxt
+			)
+			SELECT c.blkno, min(m.k * 100000 + m.s), max(m.k * 100000 + m.s)
+			  FROM chain c, LATERAL bt_page_items('merge_mr_idx', c.blkno) i
+			  JOIN merge_mr m ON m.ctid = i.htid
+			 WHERE NOT (c.nxt <> 0 AND i.itemoffset = 1)
+			 GROUP BY c.blkno, c.n ORDER BY c.n});
+		my @res;
+		for my $line (split /\n/, $out)
+		{
+			my ($b, $lo, $hi) = split /\|/, $line;
+			push @res, [ $b, int($lo / 100000), $lo % 100000,
+				int($hi / 100000), $hi % 100000 ];
+		}
+		return \@res;
+	};
+
+	for my $ios ('off', 'on')
+	{
+		for my $gap (2, 3)
+		{
+			my $name = "merge join restore across two merges, index-only $ios, gap $gap";
+			$node->safe_psql('postgres', $mr_setup);
+			my $lv = $leaves->();
+
+			# L1: last page whose highest key has k = 1; R1: its right sibling.
+			my ($i1) = grep { $lv->[$_][3] == 1 } reverse 0 .. $#$lv;
+			my ($L1, $R1) = @$lv[ $i1, $i1 + 1 ];
+			my ($L2, $R2) = @$lv[ $i1 - $gap - 1, $i1 - $gap ];
+			ok($L1->[1] == 1 && $R1->[3] == 2 && $L2->[1] == 1 && $R2->[3] == 1,
+				"$name: expected page layout");
+			my ($l1lo, $l1hi) = ($L1->[2], $L1->[4]);
+			my ($r1lo, $r1hi) = ($R1->[1] == 2 ? $R1->[2] : 1, $R1->[4]);
+			my ($l2lo, $r2hi) = ($L2->[2], $R2->[4]);
+
+			# Thin out both pairs; group 1 below 4% full, group 2 below 15%.
+			$node->safe_psql('postgres', qq{
+				DELETE FROM merge_mr WHERE k = 1 AND s BETWEEN $l1lo AND $l1hi AND s % 40 <> 0;
+				DELETE FROM merge_mr WHERE k = 1 AND s > $l1hi;
+				DELETE FROM merge_mr WHERE k = 2 AND s BETWEEN $r1lo AND $r1hi AND s % 40 <> 0;
+				DELETE FROM merge_mr WHERE k = 1 AND s BETWEEN $l2lo AND $r2hi AND s % 15 <> 0;
+				VACUUM (FREEZE) merge_mr;
+			});
+			my ($r2now) = grep { $_->[0] == $R2->[0] } @{ $leaves->() };
+			my $r2lo = $r2now->[2];
+
+			my $join_sql = "SELECT m.k * 100000 + m.s FROM merge_mr_outer o JOIN merge_mr m ON m.k = o.k ORDER BY o.k DESC";
+			my $settings = qq{
+				SET LOCAL enable_hashjoin = off; SET LOCAL enable_nestloop = off;
+				SET LOCAL enable_material = off; SET LOCAL enable_seqscan = off;
+				SET LOCAL enable_bitmapscan = off; SET LOCAL enable_indexonlyscan = $ios;
+				SET LOCAL statement_timeout = '60s';
+			};
+			my $scan = $ios eq 'on' ? 'Index Only Scan' : 'Index Scan';
+			like(
+				$node->safe_psql('postgres',
+					"BEGIN; $settings EXPLAIN (COSTS OFF) DECLARE x CURSOR FOR $join_sql; COMMIT;"),
+				qr/Merge Join.*->\s+Sort.*->\s+\Q$scan\E Backward using merge_mr_idx/s,
+				"$name: the inner side is a backward \L$scan\E");
+			my @expected = sort { $a <=> $b } @{ ids_of($node, qq{
+				SET enable_indexscan = off; SET enable_indexonlyscan = off;
+				SET enable_bitmapscan = off; SET enable_mergejoin = off;
+				SET enable_nestloop = off; $join_sql}) };
+
+			# Rows of k >= 2 bring the scan onto R1; rows of k = 1 down to
+			# R2's lowest row bring it onto R2.
+			my $to_r1 = $node->safe_psql('postgres',
+				"SELECT count(*) FROM merge_mr WHERE k >= 2");
+			my $to_r2 = $node->safe_psql('postgres',
+				"SELECT count(*) FROM merge_mr WHERE k = 1 AND s >= $r2lo");
+
+			my $s = $node->background_psql('postgres');
+			$s->query_safe(qq{
+				BEGIN ISOLATION LEVEL REPEATABLE READ;
+				$settings
+				DECLARE c CURSOR FOR $join_sql;
+			});
+			my @got = split /\n/, $s->query_safe("FETCH $to_r1 FROM c");
+			is($s->query_safe("SELECT bt_merge('merge_mr_idx', 4, 90, 1000)"),
+				'1', "$name: group 1 merged");
+			# Split R1 inside L1's old range; the cursor cannot see these rows.
+			$s->query_safe(qq{
+				INSERT INTO merge_mr SELECT 1, s FROM generate_series($l1lo, $l1hi) s WHERE s % 40 <> 0;
+				INSERT INTO merge_mr SELECT 1, s FROM generate_series($l1lo, $l1hi) s WHERE s % 40 <> 0;
+			});
+			push @got, split /\n/, $s->query_safe("FETCH $to_r2 FROM c");
+			is($s->query_safe("SELECT bt_merge('merge_mr_idx', 15, 90, 1000)"),
+				'1', "$name: group 2 merged");
+			my ($rest, $ret) = $s->query('FETCH ALL FROM c');
+			is($ret, 0, "$name: no error") or diag($s->{stderr});
+			push @got, split /\n/, $rest;
+			$s->query('COMMIT');
+			$s->quit;
+			is_deeply([ sort { $a <=> $b } @got ], \@expected,
+				"$name: rows match a hash join");
+			index_ok($node, 'merge_mr_idx', $name);
+		}
+	}
+}
+
 # ==============================================================================
 # SECTION 8: parallel scans that start on a merged page
 # ==============================================================================
@@ -627,6 +921,88 @@ $node->safe_psql('postgres', q{
 		'parallel backward scan after the merged page split matches heap');
 }
 index_ok($node, 'merge_par_idx', 'parallel');
+
+# 8b: parallel and serial scans while another session keeps merging.  The
+# scanned rows (id % 20 = 0) never change.  Another session repeatedly fills
+# a range with other rows, deletes them, runs VACUUM (which also cleans up
+# merge groups) and merges the thinned pages.  Every scan must return the
+# same rows, whatever it met on the way.
+{
+	$node->safe_psql('postgres', q{
+		CREATE TABLE merge_churn (id int) WITH (autovacuum_enabled = off, parallel_workers = 2);
+		INSERT INTO merge_churn SELECT g FROM generate_series(20, 2000000, 20) g;
+		CREATE INDEX merge_churn_idx ON merge_churn (id);
+		VACUUM (FREEZE, ANALYZE) merge_churn;
+	});
+	my $want = $node->safe_psql('postgres',
+		'SELECT count(*) || \',\' || sum(id) FROM merge_churn');
+
+	my %scans = (
+		'parallel forward index-only' => [ $parallel_prefix, 'ASC', 'Parallel Index Only Scan' ],
+		'parallel backward index-only' => [ $parallel_prefix, 'DESC', 'Parallel Index Only Scan Backward' ],
+		'parallel forward' => [ "$parallel_prefix SET enable_indexonlyscan = off;", 'ASC', 'Parallel Index Scan' ],
+		'parallel backward' => [ "$parallel_prefix SET enable_indexonlyscan = off;", 'DESC', 'Parallel Index Scan Backward' ],
+		'serial backward' => [ "$serial_prefix SET enable_indexonlyscan = off;", 'DESC', 'Index Scan Backward' ]);
+	for my $name (sort keys %scans)
+	{
+		my ($prefix, $dir, $plan) = @{ $scans{$name} };
+		like($node->safe_psql('postgres',
+				"$prefix EXPLAIN (COSTS OFF) SELECT id FROM merge_churn WHERE id % 20 = 0 ORDER BY id $dir"),
+			qr/\Q$plan\E using merge_churn_idx/, "churn, $name: plan");
+	}
+
+	my $churn_sql = '';
+	for my $i (0 .. 24)
+	{
+		my $lo = ($i * 77_003) % 1_980_000;
+		$churn_sql .= qq{
+			INSERT INTO merge_churn SELECT g FROM generate_series($lo, $lo + 20000) g WHERE g % 20 <> 0;
+			DELETE FROM merge_churn WHERE id BETWEEN $lo AND $lo + 20000 AND id % 20 <> 0;
+			VACUUM (INDEX_CLEANUP ON) merge_churn;
+			SELECT 'merges ' || bt_merge('merge_churn_idx', 10, 90, 1000);
+		};
+	}
+	my $churn_file = PostgreSQL::Test::Utils::tempdir() . '/churn.sql';
+	PostgreSQL::Test::Utils::append_to_file($churn_file, $churn_sql);
+	my ($churn_out, $churn_err) = ('', '');
+	my $churn = IPC::Run::start(
+		[
+			$node->installed_command('psql'), '-X', '-A', '-t', '-v', 'ON_ERROR_STOP=1',
+			'-p', $node->port, '-d', 'postgres', '-f', $churn_file
+		],
+		'>', \$churn_out, '2>', \$churn_err);
+
+	my %bad;
+	my $nscans = 0;
+	my $deadline = time() + $PostgreSQL::Test::Utils::timeout_default;
+	while ($churn->pumpable)
+	{
+		if (time() > $deadline)
+		{
+			$churn->kill_kill;
+			fail('churn: session did not finish in time');
+			last;
+		}
+		for my $name (sort keys %scans)
+		{
+			my ($prefix, $dir) = @{ $scans{$name} };
+			my $got = $node->safe_psql('postgres', qq{
+				$prefix SET statement_timeout = '60s';
+				SELECT count(*) || ',' || sum(id) FROM
+				  (SELECT id FROM merge_churn WHERE id % 20 = 0 ORDER BY id $dir OFFSET 0) s});
+			$nscans++;
+			$bad{$name}++ if $got ne $want;
+		}
+		$churn->pump_nb;
+	}
+	$churn->finish;
+	is($churn->result(0), 0, 'churn: session finished cleanly') or diag($churn_err);
+	my $merges = 0;
+	$merges += $1 while $churn_out =~ /merges (\d+)/g;
+	cmp_ok($merges, '>', 0, "churn: merges happened ($merges merges, $nscans scans)");
+	is_deeply(\%bad, {}, 'churn: every scan returned the unchanged rows');
+	index_ok($node, 'merge_churn_idx', 'churn');
+}
 
 # ==============================================================================
 # SECTION 9: merges that race with VACUUM
@@ -894,6 +1270,11 @@ $node->safe_psql('postgres', q{
 $node->backup('for_standby');
 my $standby = PostgreSQL::Test::Cluster->new('standby');
 $standby->init_from_backup($node, 'for_standby', has_streaming => 1);
+# cancel a standby query that blocks replay quickly
+$standby->append_conf('postgresql.conf', q{
+hot_standby_feedback = off
+max_standby_streaming_delay = 1s
+});
 $standby->start;
 
 $node->safe_psql('postgres', q{
@@ -937,6 +1318,73 @@ isnt($ret, 0, 'standby: bt_merge fails during recovery');
 like($err, qr/recovery is in progress/, 'standby: bt_merge reports recovery');
 is($standby->safe_psql('postgres', 'SELECT 1'), '1',
 	'standby: still accepts queries after bt_merge');
+
+# An index-only cursor on the standby still has the left page's items when
+# the primary merges that page and VACUUM removes the moved rows.  Replay of
+# the merge must wait for the cursor's pin, so the cursor is either cancelled
+# by a recovery conflict or returns no deleted rows.
+{
+	my $name = 'standby index-only cursor across merge and VACUUM';
+	$node->safe_psql('postgres', q{
+		CREATE TABLE merge_sb (id int) WITH (autovacuum_enabled = off);
+		INSERT INTO merge_sb SELECT generate_series(1, 20000);
+		CREATE INDEX merge_sb_idx ON merge_sb (id);
+		VACUUM ANALYZE merge_sb;
+		DELETE FROM merge_sb WHERE id BETWEEN 6589 AND 7320 AND id % 40 <> 0;
+		VACUUM merge_sb;
+		DELETE FROM merge_sb WHERE id IN (6800, 6840, 6880, 6920);
+	});
+	$node->wait_for_replay_catchup($standby);
+	my $expected = $standby->safe_psql('postgres',
+		"$heap_prefix SELECT id FROM merge_sb WHERE id > 6600 ORDER BY id LIMIT 12");
+	my $log_offset = -s $standby->logfile;
+
+	my $cur = $standby->background_psql('postgres');
+	my $curpid = $cur->query_safe('SELECT pg_backend_pid()');
+	like(
+		$cur->query_safe(q{
+			SET enable_seqscan = off; SET enable_bitmapscan = off;
+			EXPLAIN (COSTS OFF) SELECT id FROM merge_sb WHERE id >= 6589 ORDER BY id;
+		}),
+		qr/Index Only Scan/,
+		"$name: plan is an index-only scan");
+	is( $cur->query_safe(q{
+			BEGIN ISOLATION LEVEL REPEATABLE READ;
+			DECLARE c CURSOR FOR SELECT id FROM merge_sb WHERE id >= 6589 ORDER BY id;
+			FETCH 1 FROM c;
+		}),
+		'6600',
+		"$name: cursor starts at 6600");
+
+	cmp_ok($node->safe_psql('postgres', "SELECT bt_merge('merge_sb_idx', 10, 90, 100)"),
+		'>', 0, "$name: merge happened on the primary");
+	$node->safe_psql('postgres', 'VACUUM merge_sb');
+	$node->wait_for_replay_catchup($standby);
+
+	# Replay has passed the merge, so the cursor's backend is either gone or
+	# never blocked replay.  Give a cancelled backend a moment to exit.
+	my $gone = 0;
+	for (1 .. 100)
+	{
+		$gone = $standby->safe_psql('postgres',
+			"SELECT NOT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $curpid)") eq 't';
+		last if $gone;
+		usleep(100_000);
+	}
+	if ($gone)
+	{
+		ok($standby->log_contains(
+				qr/User was holding shared buffer pin for too long/, $log_offset),
+			"$name: cursor cancelled by a recovery conflict");
+	}
+	else
+	{
+		is($cur->query_safe('FETCH 12 FROM c'), $expected,
+			"$name: no deleted rows returned");
+	}
+	eval { $cur->quit; };
+	table_matches_heap($standby, 'merge_sb', 'id', $name);
+}
 $standby->stop;
 
 # crash recovery replays the same records on the primary
