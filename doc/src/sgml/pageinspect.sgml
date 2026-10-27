@@ -518,6 +518,110 @@ test=# SELECT itemoffset, ctid, itemlen, nulls, vars, data, dead, htid, tids[0:2
      </para>
     </listitem>
    </varlistentry>
+
+   <varlistentry>
+    <term>
+     <function>bt_find_merge_candidates(relname text, merge_candidate_max_pct float8 DEFAULT 10.0, merge_destination_max_pct float8 DEFAULT 90.0, num_pages int4 DEFAULT 1) returns setof record</function>
+     <indexterm>
+      <primary>bt_find_merge_candidates</primary>
+     </indexterm>
+    </term>
+
+    <listitem>
+     <para>
+      <function>bt_find_merge_candidates</function> walks the leaf level
+      of a B-tree index from left to right and returns up to
+      <parameter>num_pages</parameter> pairs of adjacent leaf pages that
+      could be merged.  A pair qualifies when each page is at most
+      <parameter>merge_candidate_max_pct</parameter> percent full, the
+      two pages together are at most
+      <parameter>merge_destination_max_pct</parameter> percent of a page,
+      and both pages have the same parent.  The leftmost leaf page is
+      never part of a pair.  The free space columns are percentages of
+      the page size; <structfield>result_free_space</structfield> is an
+      estimate of the free space left after the merge.  The index is not
+      changed.  For example:
+<screen>
+test=# SELECT * FROM bt_find_merge_candidates('t_idx', 10.0, 90.0, 3);
+ left_blkno | right_blkno | free_space_left | free_space_right | result_free_space
+------------+-------------+-----------------+------------------+-------------------
+          2 |           4 |     94.82421875 |      94.82421875 |        89.6484375
+          4 |           5 |     94.82421875 |     94.580078125 |      89.404296875
+          5 |           6 |    94.580078125 |      94.82421875 |      89.404296875
+(3 rows)
+</screen>
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <function>bt_merge_detail(relname text, left_blkno int8, show_tids boolean) returns setof record</function>
+     <indexterm>
+      <primary>bt_merge_detail</primary>
+     </indexterm>
+    </term>
+
+    <listitem>
+     <para>
+      <function>bt_merge_detail</function> shows the three pages a merge
+      of leaf page <parameter>left_blkno</parameter> would change: the
+      parent, the left page, and its right sibling, in that order.
+      <structfield>first_val</structfield> and
+      <structfield>last_val</structfield> show the first and last keys on
+      a leaf page, and <structfield>high_key</structfield> its high key, in
+      the same format as the <structfield>data</structfield> column of
+      <function>bt_page_items</function>.  When
+      <parameter>show_tids</parameter> is true,
+      <structfield>tids</structfield> holds the heap TIDs of a leaf page,
+      with posting lists expanded, or the downlinks of the parent page.
+      An error is raised if <parameter>left_blkno</parameter> is not a live leaf page,
+      is the rightmost leaf page, or has a different parent than its
+      right sibling.  For example:
+<screen>
+test=# SELECT page_role, blkno, btpo_prev, btpo_next, btpo_flags, free_size, num_tids, first_val, last_val
+        FROM bt_merge_detail('t_idx', 2, false);
+ page_role | blkno | btpo_prev | btpo_next | btpo_flags | free_size | num_tids |        first_val        |        last_val
+-----------+-------+-----------+-----------+------------+-----------+----------+-------------------------+-------------------------
+ parent    |     3 |         0 |         0 |          2 |      7596 |       28 |                         |
+ left      |     2 |         1 |         4 |          1 |      7768 |       18 | 7c 01 00 00 00 00 00 00 | d0 02 00 00 00 00 00 00
+ right     |     4 |         2 |         5 |          1 |      7768 |       18 | e4 02 00 00 00 00 00 00 | 38 04 00 00 00 00 00 00
+(3 rows)
+</screen>
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>
+     <function>bt_merge(relname text, merge_candidate_max_pct float8 DEFAULT 10.0, merge_destination_max_pct float8 DEFAULT 90.0, num_pages int4 DEFAULT 1) returns int4</function>
+     <indexterm>
+      <primary>bt_merge</primary>
+     </indexterm>
+    </term>
+
+    <listitem>
+     <para>
+      <function>bt_merge</function> merges pairs of leaf pages chosen by
+      the same rules as <function>bt_find_merge_candidates</function>, and
+      returns the number of merges done.  Unlike the other functions in
+      this module, it <emphasis>modifies the index</emphasis>; it is
+      intended for testing.  <parameter>num_pages</parameter> is the
+      number of leaf pages examined, not the number of merges.  The tuples
+      of the left page are moved into its right sibling, and the left page
+      is left as a tombstone, which <function>bt_page_stats</function>
+      reports with type <literal>m</literal>.  A later
+      <command>VACUUM</command> removes it.  For example:
+<screen>
+test=# SELECT bt_merge('t_idx', 10.0, 90.0, 100);
+ bt_merge
+----------
+       13
+(1 row)
+</screen>
+     </para>
+    </listitem>
+   </varlistentry>
   </variablelist>
  </sect2>
 
