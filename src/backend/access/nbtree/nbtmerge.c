@@ -24,7 +24,6 @@
 #include "common/int.h"
 #include "storage/bufmgr.h"
 #include "storage/lmgr.h"
-#include "utils/injection_point.h"
 #include "storage/predicate.h"
 #include "miscadmin.h"
 
@@ -368,8 +367,6 @@ _bt_mergepage(BTMergeState mstate)
 	leftpage = BufferGetPage(leftbuf);
 	leftopaque = BTPageGetOpaque(leftpage);
 	Assert(P_ISLEAF(leftopaque));
-
-	INJECTION_POINT("after_left_lock", NULL);
 
 	rightbuf = ReadBuffer(rel, mstate.right_blkno);
 	LockBuffer(rightbuf, BT_WRITE);

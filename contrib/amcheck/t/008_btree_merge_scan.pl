@@ -14,8 +14,10 @@
 # and merges replayed on a standby.
 #
 # Layouts used here are deterministic.  In each setup, the first leaf pair
-# that gets merged is blocks (2, 4), which is why the injection points in
-# _bt_readnextpage() are keyed on block 4 (forward) and block 2 (backward).
+# that gets merged is blocks (2, 4).  The injection point in
+# _bt_readnextpage() is attached for merge_test_idx only, and stops a scan
+# at its first step to another page, so each case chooses where the scan
+# stops by choosing the page it starts on.
 #
 use strict;
 use warnings FATAL => 'all';
@@ -154,17 +156,48 @@ sub index_matches_heap
 	}
 }
 
-# Run $scan_query in a background psql, pause it at $inj_point, run
-# $merge_sql (+ optional $post_sql) in another session, resume, and compare
-# the scan result to the heap result computed beforehand.
+# Replace {L_MIN}, {R_MAX} and so on in $where with the smallest or largest
+# key on a page of the merge pair: L is block 2, R its right sibling, and R2
+# the page right of R.  A scan bounded by one of these keys starts on that
+# page.
+sub fill_bounds
+{
+	my ($where) = @_;
+	return $where unless $where =~ /\{/;
+
+	my %blk = (L => 2);
+	$blk{R} = $node->safe_psql('postgres',
+		"SELECT btpo_next FROM bt_page_stats('merge_test_idx', $blk{L});");
+	$blk{R2} = $node->safe_psql('postgres',
+		"SELECT btpo_next FROM bt_page_stats('merge_test_idx', $blk{R});");
+
+	for my $page (keys %blk)
+	{
+		# Item 1 is the high key on every page except the rightmost.
+		my ($min, $max) = split(/\|/, $node->safe_psql('postgres', qq{
+			SELECT min(m.id), max(m.id)
+			FROM bt_page_stats('merge_test_idx', $blk{$page}) s,
+				bt_page_items('merge_test_idx', $blk{$page}) i
+				JOIN merge_test m ON m.ctid = i.htid
+			WHERE i.itemoffset > CASE WHEN s.btpo_next <> 0 THEN 1 ELSE 0 END;
+		}));
+		$where =~ s/\{${page}_MIN\}/$min/g;
+		$where =~ s/\{${page}_MAX\}/$max/g;
+	}
+	return $where;
+}
+
+# Run $scan_query in a background psql, pause it at its first step to
+# another page, run bt_merge() (+ optional $post_sql) in another session,
+# resume, and compare the scan result to the heap result computed beforehand.
 sub run_concurrent_scan
 {
 	my (%p) = @_;
 	my $name       = $p{test_name};
-	my $inj_point  = $p{injection_point};
+	my $inj_point  = 'nbtree-read-next-page';
 	my $prefix     = $p{prefix};
 	my $parallel   = $p{parallel} // 0;
-	my $where      = $p{where};
+	my $where      = fill_bounds($p{where});
 	my $desc       = $p{desc} // 0;
 	my $merge_args = $p{merge_args} // '10.0, 90.0, 10';
 	my $post_sql   = $p{post_sql} // '';
@@ -194,8 +227,9 @@ sub run_concurrent_scan
 	my $expected = heap_rows($where, $desc);
 	cmp_ok(scalar(@$expected), '>', 0, "$name: expected result is non-empty");
 
+	# Only scans of merge_test_idx stop, so other sessions never wait here.
 	$node->safe_psql('postgres',
-		"SELECT injection_points_attach('$inj_point', 'wait');");
+		"SELECT injection_points_attach('$inj_point', 'wait', 'merge_test_idx');");
 
 	my ($stdout, $stderr);
 	my $h = IPC::Run::start(
@@ -215,6 +249,10 @@ sub run_concurrent_scan
 	my $merges = $node->safe_psql('postgres',
 		"SELECT * FROM bt_merge('merge_test_idx', $merge_args);");
 	cmp_ok($merges, '>', 0, "$name: merge happened while scan was paused");
+	is( $node->safe_psql('postgres',
+			"SELECT btpo_flags & 1024 <> 0 FROM bt_page_stats('merge_test_idx', 2);"),
+		't',
+		"$name: block 2 was merged into its right sibling");
 	$node->safe_psql('postgres', $post_sql) if $post_sql ne '';
 
 	# Detach first, so the scan cannot stop there again (a backward scan can
@@ -308,11 +346,15 @@ index_matches_heap('split on merged page', 'id >= 0');
 # ==============================================================================
 my $split_sql = q{INSERT INTO merge_test SELECT generate_series(367, 367 + 500);};
 
-# Each case: scan paused before stepping to the page next to the merge pair;
-# the merge happens; the scan resumes.  The forward hook pauses after the
-# scan read the left page of the pair (so it must filter the merged page
-# using the boundary stored in the tombstone); the backward hook pauses
-# after the scan read the right page.
+# Each case: scan paused at its first step to another page; the merge
+# happens; the scan resumes.  A serial forward scan starts on the left page
+# of the pair, so it pauses after reading it and must filter the merged page
+# using the boundary stored in the tombstone.  A serial backward scan starts
+# on the right page, so it pauses after reading it.
+#
+# Parallel scans start one page outside the pair instead.  Under Gather
+# Merge, a participant that read a page waits for the paused one while
+# keeping its pin on that page, and bt_merge() skips a pinned pair.
 my @cases;
 for my $mode ('serial', 'parallel')
 {
@@ -326,14 +368,14 @@ for my $mode ('serial', 'parallel')
 		for my $desc (0, 1)
 		{
 			push @cases, {
-				test_name       => ucfirst($mode) . ' ' . ($desc ? 'backward' : 'forward') . " scan, $layout: wait -> merge",
-				layout          => $layout,
-				injection_point => $desc ? 'before_read_prev_page' : 'before_read_next_page',
-				prefix          => $prefix,
-				parallel        => $par,
-				where           => 'id >= 0',
-				desc            => $desc,
-				merge_args      => $margs,
+				test_name  => ucfirst($mode) . ' ' . ($desc ? 'backward' : 'forward') . " scan, $layout: wait -> merge",
+				layout     => $layout,
+				prefix     => $prefix,
+				parallel   => $par,
+				where      => $par ? ($desc ? 'id <= {R2_MAX}' : 'id >= 0')
+				  : ($desc ? 'id <= {R_MAX}' : 'id >= {L_MIN}'),
+				desc       => $desc,
+				merge_args => $margs,
 			};
 
 			# merge followed by a split of the merged page
@@ -347,20 +389,38 @@ for my $mode ('serial', 'parallel')
 	}
 }
 
-# Also: scans bounded on one side, so the scan starts or stops inside the
-# merged range.
+# Also: scans bounded on both sides inside the merge pair, so the scan
+# starts and stops inside the merged range.
 for my $desc (0, 1)
 {
 	push @cases, {
-		test_name       => 'Serial ' . ($desc ? 'backward' : 'forward') . ' bounded scan: wait -> merge',
-		layout          => 'sparse_10k',
-		injection_point => $desc ? 'before_read_prev_page' : 'before_read_next_page',
-		prefix          => $serial_prefix,
-		parallel        => 0,
-		where           => 'id >= 1 AND id <= 3000',
-		desc            => $desc,
-		merge_args      => '10.0, 90.0, 10',
+		test_name  => 'Serial ' . ($desc ? 'backward' : 'forward') . ' bounded scan: wait -> merge',
+		layout     => 'sparse_10k',
+		prefix     => $serial_prefix,
+		parallel   => 0,
+		where      => 'id >= {L_MIN} AND id <= {R_MAX}',
+		desc       => $desc,
+		merge_args => '10.0, 90.0, 10',
 	};
+}
+
+# Also: scans paused outside the pair.  A forward scan from the first page
+# pauses before reading the left page, and a backward scan from the page
+# right of the pair pauses before reading the right page.
+for my $layout (qw(sparse_10k holes_5k))
+{
+	for my $desc (0, 1)
+	{
+		push @cases, {
+			test_name  => 'Serial ' . ($desc ? 'backward' : 'forward') . " scan, $layout: wait " . ($desc ? 'right' : 'left') . ' of the pair -> merge',
+			layout     => $layout,
+			prefix     => $serial_prefix,
+			parallel   => 0,
+			where      => $desc ? 'id <= {R2_MAX}' : 'id >= 0',
+			desc       => $desc,
+			merge_args => '10.0, 90.0, 10',
+		};
+	}
 }
 
 for my $c (@cases)

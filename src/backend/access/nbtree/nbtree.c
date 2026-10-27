@@ -39,7 +39,6 @@
 #include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
-#include "utils/injection_point.h"
 
 
 

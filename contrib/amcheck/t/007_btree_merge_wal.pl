@@ -92,6 +92,26 @@ sub waldump_range
 	return qx{pg_waldump -p $waldir -s $start_lsn -e $end_lsn 2>/dev/null};
 }
 
+#
+# Delete some rows and VACUUM, so that VACUUM scans the index and cleans up
+# merge groups.  Cleanup needs dead index tuples (otherwise VACUUM skips the
+# index) and a safemergexid older than every snapshot, so an XID is used
+# first.  Returns the WAL VACUUM wrote.
+#
+sub vacuum_merge_cleanup
+{
+	my ($node) = @_;
+
+	$node->safe_psql('postgres', 'DELETE FROM merge_test WHERE id % 7 = 0');
+	$node->safe_psql('postgres', 'SELECT pg_current_xact_id()');
+
+	my $start = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+	$node->safe_psql('postgres', 'VACUUM merge_test');
+	my $end = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+
+	return waldump_range($node, $start, $end);
+}
+
 my $node = PostgreSQL::Test::Cluster->new('primary');
 $node->init(allows_streaming => 1);
 $node->start;
@@ -111,7 +131,6 @@ $node->safe_psql('postgres', $setup_sql);
 
 my ($dedup_start, $dedup_end, $split_start, $split_end) =
   merge_and_stress($node, 'WAL generation');
-$node->safe_psql('postgres', 'CHECKPOINT');
 
 like(
 	waldump_range($node, $dedup_start, $dedup_end),
@@ -126,22 +145,34 @@ like(
 $node->safe_psql('postgres', $check_sql);
 
 #
-# With wal_consistency_checking = 'btree' and full_page_writes = off, the
-# server re-applies every btree WAL record to a scratch copy of the page and
-# compares the result byte-for-byte.  Any difference panics the server.
-# Surviving the workload proves the DEDUP and SPLIT redo paths preserve the
-# MA block number stored in pd_prune_xid.
+# With wal_consistency_checking = 'btree,Btree2' and full_page_writes = off,
+# the server re-applies every btree WAL record to a scratch copy of the page
+# and compares the result byte-for-byte.  Any difference panics the server.
+# Btree2 holds the merge records, so it must be listed too.  Surviving the
+# workload proves the DEDUP and SPLIT redo paths preserve the MA block number
+# stored in pd_prune_xid, and the VACUUM afterwards checks the merge cleanup
+# records.
 #
 
 $node->append_conf('postgresql.conf',
-	"wal_consistency_checking = 'btree'\nfull_page_writes = off");
+	"wal_consistency_checking = 'btree,Btree2'\nfull_page_writes = off");
 $node->restart;
 
 $node->safe_psql('postgres', 'DROP TABLE merge_test CASCADE');
 $node->safe_psql('postgres', $setup_sql);
 merge_and_stress($node, 'WAL consistency checking');
 
-# Server is still up — redo matched the write side for every record.
+my $cleanup_wal = vacuum_merge_cleanup($node);
+like(
+	$cleanup_wal,
+	qr/rmgr: Btree2 .*desc: CLEAR_MERGED_FLAG/,
+	'VACUUM wrote CLEAR_MERGED_FLAG under WAL consistency checking');
+like(
+	$cleanup_wal,
+	qr/rmgr: Btree2 .*desc: MARK_MA_AS_HD/,
+	'VACUUM wrote MARK_MA_AS_HD under WAL consistency checking');
+
+# Server is still up, so redo matched the write side for every record.
 $node->safe_psql('postgres', $check_sql);
 
 #
@@ -161,9 +192,7 @@ pass('bt_index_check passes after crash recovery with merged pages');
 
 #
 # Streaming replica: with full_page_writes still off, the standby must
-# reconstruct every modified page from deltas alone.  We also verify that
-# VACUUM-driven merge cleanup triggers a snapshot recovery conflict for a
-# standby transaction whose snapshot predates the merge's safemergexid.
+# reconstruct every modified page from deltas alone.
 #
 
 $node->safe_psql('postgres', 'DROP TABLE merge_test CASCADE');
@@ -176,34 +205,64 @@ $standby->append_conf('postgresql.conf',
 	"max_standby_streaming_delay = '50ms'");
 $standby->start;
 
-# Open a repeatable-read transaction on the standby before the merge runs so
-# its snapshot predates the merge's safemergexid.  A plain SELECT avoids
-# leaving a buffer pin, which would produce a pin conflict rather than the
-# snapshot conflict we intend to test.
-my $standby_psql =
-  $standby->background_psql('postgres', on_error_stop => 0);
-my $result = $standby_psql->query_safe(q{
-	BEGIN ISOLATION LEVEL REPEATABLE READ;
-	SELECT 1;
-});
-like($result, qr/^1$/m, 'standby snapshot established before merge');
-
 merge_and_stress($node, 'streaming replication');
 $node->wait_for_replay_catchup($standby);
 
 # bt_index_check on the standby exercises the delta redo paths for MERGE,
-# DEDUP, and SPLIT — the paths most likely to corrupt the MA block number.
+# DEDUP, and SPLIT, the paths most likely to corrupt the MA block number.
 $standby->safe_psql('postgres', $check_sql);
 pass(
 	'bt_index_check passes on standby after replaying merge WAL (full_page_writes off)'
 );
 
-# VACUUM clears the BTP_MERGED flags and writes a CLEAR_MERGE_FLAG record
-# carrying safemergexid.  On replay, ResolveRecoveryConflictWithSnapshotFullXid
-# cancels the standby transaction opened above.
-my $log_offset = -s $standby->logfile;
-$node->safe_psql('postgres', 'VACUUM merge_test');
+#
+# Merge cleanup must cancel a standby query whose snapshot is older than
+# safemergexid.  Heap records VACUUM writes must not cause that conflict
+# instead, so every heap change happens before the standby snapshot: the rows
+# VACUUM removes are deleted first.  The heap horizons are then older than the
+# snapshot, and only the cleanup record can conflict with it.
+#
+
+$node->safe_psql('postgres', 'DROP TABLE merge_test CASCADE');
+$node->safe_psql('postgres', $setup_sql);
+$node->safe_psql('postgres', 'DELETE FROM merge_test WHERE id % 100 = 0');
 $node->wait_for_replay_catchup($standby);
+
+# A plain SELECT avoids leaving a buffer pin, which would produce a pin
+# conflict rather than the snapshot conflict we intend to test.
+my $standby_psql =
+  $standby->background_psql('postgres', on_error_stop => 0);
+my $result = $standby_psql->query_safe(q{
+	BEGIN ISOLATION LEVEL REPEATABLE READ;
+	SELECT pg_snapshot_xmin(pg_current_snapshot());
+});
+like($result, qr/^\d+$/m, 'standby snapshot established before merge');
+my ($standby_xmin) = $result =~ /(\d+)\s*$/;
+
+my $log_offset = -s $standby->logfile;
+my $start_lsn = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+isnt(
+	$node->safe_psql('postgres',
+		q{SELECT bt_merge('merge_test_idx', 10.0, 90.0, 10)}),
+	'0',
+	'bt_merge() merged pages after the standby snapshot');
+
+# Use an XID so safemergexid becomes older than every snapshot on the
+# primary, then VACUUM: it removes the deleted rows from the index and
+# writes CLEAR_MERGED_FLAG with safemergexid.
+$node->safe_psql('postgres', 'SELECT pg_current_xact_id()');
+$node->safe_psql('postgres', 'VACUUM merge_test');
+my $end_lsn = $node->safe_psql('postgres', 'SELECT pg_current_wal_lsn()');
+$node->wait_for_replay_catchup($standby);
+
+my $wal = waldump_range($node, $start_lsn, $end_lsn);
+like(
+	$wal,
+	qr/rmgr: Btree2 .*desc: CLEAR_MERGED_FLAG/,
+	'VACUUM wrote CLEAR_MERGED_FLAG');
+my @heap_horizons = $wal =~ /rmgr: Heap2? .*snapshotConflictHorizon: (\d+)/g;
+is( scalar(grep { $_ >= $standby_xmin } @heap_horizons),
+	0, 'no heap record conflicts with the standby snapshot');
 
 my $new_offset = $standby->wait_for_log(
 	qr/User query might have needed to see row versions that must be removed/,

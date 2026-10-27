@@ -26,7 +26,6 @@
 #include "utils/injection_point.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
-#include "utils/injection_point.h"
 
 
 static inline void _bt_drop_lock_and_maybe_pin(Relation rel, BTScanOpaque so);
@@ -189,12 +188,6 @@ _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
 		*bufP = _bt_relandgetbuf(rel, *bufP, child, page_access);
 
 		/* okay, all set to move down a level */
-		if (strcmp(RelationGetRelationName(rel), "merge_test_idx") == 0 && opaque->btpo_level == 1 && access == BT_WRITE)
-		{
-			_bt_relbuf(rel, *bufP);
-			INJECTION_POINT("before_leaf_level", NULL);
-			*bufP = _bt_getbuf(rel, child, page_access);
-		}
 	}
 
 	/*
@@ -1918,15 +1911,7 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 	Assert(!(blkno == P_NONE && seized));
 	Assert(!BTScanPosIsPinned(so->currPos));
 
-	if (strcmp(RelationGetRelationName(rel), "merge_test_idx") == 0 && ScanDirectionIsForward(dir) && blkno == 4)
-	{
-		INJECTION_POINT("before_read_next_page", NULL);
-	}
-
-	if (strcmp(RelationGetRelationName(rel), "merge_test_idx") == 0 && ScanDirectionIsBackward(dir) && blkno == 2)
-	{
-		INJECTION_POINT("before_read_prev_page", NULL);
-	}
+	INJECTION_POINT("nbtree-read-next-page", RelationGetRelationName(rel));
 
 	/*
 	 * Remember that the scan already read lastcurrblkno, a page to the left
