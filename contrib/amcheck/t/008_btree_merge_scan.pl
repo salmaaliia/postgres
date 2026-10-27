@@ -662,6 +662,117 @@ for my $dir ('ASC', 'DESC')
 	cmp_ok($merged, '>', 0, 'bounded cursor: merges happened');
 }
 
+# 6c: a posting list on the merged page holds TIDs from both sides of the
+# boundary.  Key 500 has entries on both the left page (block 2) and the
+# right page (block 4).  The index is built without deduplication, so they
+# are plain tuples.  After the merge, another session turns deduplication on
+# and fills the merged page with more rows of key 500, which the cursor
+# cannot see.  The deduplication pass joins the entries from both pages into
+# one posting list.  The scan must split that posting list at the boundary
+# TID: forward it skips the left page's TIDs, backward it returns only
+# them.  Rows are returned as id * 1000 + n, so every row of key 500 is
+# different.
+{
+	my $post_setup = q{
+		DROP TABLE IF EXISTS merge_post;
+		CREATE TABLE merge_post (id int, n int) WITH (autovacuum_enabled = off);
+		INSERT INTO merge_post SELECT g, 0 FROM generate_series(1, 2000) g;
+		INSERT INTO merge_post SELECT 500, g FROM generate_series(1, 299) g;
+		CREATE INDEX merge_post_idx ON merge_post (id)
+			WITH (deduplicate_items = off);
+		DELETE FROM merge_post WHERE id BETWEEN 367 AND 799
+			AND NOT (id <> 500 AND id % 20 = 0)
+			AND NOT (id = 500 AND n % 25 = 0);
+		VACUUM (FREEZE) merge_post;
+	};
+	my $dedup_sql = q{
+		ALTER INDEX merge_post_idx SET (deduplicate_items = on);
+		INSERT INTO merge_post SELECT 500, g FROM generate_series(1000, 1999) g;
+	};
+	# Does a posting list on a merged page hold the TIDs of both rows?
+	my $straddle_sql = q{
+		WITH m AS MATERIALIZED (
+			SELECT blkno FROM bt_multi_page_stats('merge_post_idx', 1, -1)
+			WHERE type = 'l' AND btpo_flags & 512 <> 0)
+		SELECT count(*) > 0
+		FROM m, LATERAL bt_page_items('merge_post_idx', m.blkno) i
+		WHERE i.tids @> ARRAY[
+			(SELECT ctid FROM merge_post WHERE id = 500 AND n = %d),
+			(SELECT ctid FROM merge_post WHERE id = 500 AND n = %d)];
+	};
+	my %orders = (
+		far => [ [ 1000, 'forward' ], [ 1000, 'backward' ], [ 1000, 'forward' ] ],
+		back => [ [ 1000, 'backward' ], [ 1000, 'forward' ], [ 1000, 'backward' ] ]);
+
+	for my $dir ('ASC', 'DESC')
+	{
+		for my $first (3, 12)
+		{
+			for my $order (sort keys %orders)
+			{
+				my @steps = @{ $orders{$order} };
+				my $name = "posting list cursor $dir, merge after $first rows, turn $order";
+				my $q = "SELECT id * 1000 + n FROM merge_post"
+				  . " WHERE id BETWEEN 367 AND 799 ORDER BY id $dir";
+				$node->safe_psql('postgres', $post_setup);
+
+				# Key 500 must be on both pages of the pair.
+				my ($l_max, $r_min) = split(/\|/, $node->safe_psql('postgres', q{
+					SELECT max(m.n) FILTER (WHERE s.blkno = 2),
+						min(m.n) FILTER (WHERE s.blkno = 4)
+					FROM (VALUES (2), (4)) s(blkno),
+						LATERAL bt_page_items('merge_post_idx', s.blkno) i
+						JOIN merge_post m ON m.ctid = i.htid
+					WHERE m.id = 500;
+				}));
+				ok(defined $l_max && defined $r_min && $l_max ne '' && $r_min ne '',
+					"$name: key 500 is on both pages");
+
+				# Index order of key 500 is heap TID order.
+				my $rows = ids_of($node,
+					"$heap_prefix SELECT id * 1000 + n FROM merge_post"
+					  . " WHERE id BETWEEN 367 AND 799 ORDER BY id $dir, ctid $dir");
+				my @expected = simulate_fetches($rows, $first, @steps);
+
+				my $s = $node->background_psql('postgres');
+				$s->query_safe(qq{
+					BEGIN ISOLATION LEVEL REPEATABLE READ;
+					SET LOCAL enable_seqscan = off;
+					SET LOCAL enable_bitmapscan = off;
+					SET LOCAL statement_timeout = '60s';
+					DECLARE c SCROLL CURSOR FOR $q;
+				});
+				is($s->query_safe("FETCH $first FROM c"),
+					join("\n", @$rows[ 0 .. $first - 1 ]),
+					"$name: first FETCH");
+				cmp_ok($s->query_safe(
+						"SELECT bt_merge('merge_post_idx', 10, 90, 1000)"),
+					'>', 0, "$name: merge happened");
+				is( $node->safe_psql('postgres',
+						"SELECT btpo_flags & 1024 <> 0 FROM bt_page_stats('merge_post_idx', 2);"),
+					't', "$name: block 2 was merged into its right sibling");
+
+				$node->safe_psql('postgres', $dedup_sql);
+				is( $node->safe_psql('postgres',
+						sprintf($straddle_sql, $l_max, $r_min)),
+					't',
+					"$name: a posting list holds TIDs from both pages");
+
+				for my $i (0 .. $#steps)
+				{
+					my ($cnt, $way) = @{ $steps[$i] };
+					is($s->query_safe("FETCH $way $cnt FROM c"),
+						join("\n", @{ $expected[$i] }),
+						"$name: FETCH $way $cnt");
+				}
+				$s->query_safe('COMMIT');
+				$s->quit;
+				index_ok($node, 'merge_post_idx', $name);
+			}
+		}
+	}
+}
+
 # ==============================================================================
 # SECTION 7: merge join restores a mark after a merge
 # ==============================================================================
