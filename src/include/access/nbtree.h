@@ -265,8 +265,8 @@ typedef struct BTMetaPageData
 typedef struct BTMergedAwayPageData
 {
 	FullTransactionId safemergexid;
-	uint16			  boundary_size;
-}			BTMergedAwayPageData;
+	uint16		boundary_size;
+} BTMergedAwayPageData;
 
 static inline void
 BTPageSetMerged(Page page)
@@ -278,26 +278,26 @@ BTPageSetMerged(Page page)
 }
 
 static inline void
-BTPageSetMergedAway(Page page, FullTransactionId safemergexid, 
+BTPageSetMergedAway(Page page, FullTransactionId safemergexid,
 					IndexTuple boundaryitup, Size boundarysz)
 {
 	BTPageOpaque opaque;
 	PageHeader	header;
 	BTMergedAwayPageData *contents;
-	char        *dest;
+	char	   *dest;
 
 	opaque = BTPageGetOpaque(page);
 	header = ((PageHeader) page);
 
 	opaque->btpo_flags |= BTP_MERGED_AWAY | BTP_HAS_FULLXID;
-	header->pd_lower	= 	MAXALIGN(SizeOfPageHeaderData) +
-							MAXALIGN(sizeof(BTMergedAwayPageData)) +
-							MAXALIGN(boundarysz);
+	header->pd_lower = MAXALIGN(SizeOfPageHeaderData) +
+		MAXALIGN(sizeof(BTMergedAwayPageData)) +
+		MAXALIGN(boundarysz);
 	header->pd_upper = header->pd_special;
 
 	contents = (BTMergedAwayPageData *) PageGetContents(page);
 	contents->safemergexid = safemergexid;
-	contents->boundary_size	= boundarysz;
+	contents->boundary_size = boundarysz;
 
 	dest = ((char *) contents) + MAXALIGN(sizeof(BTMergedAwayPageData));
 	memcpy(dest, boundaryitup, boundarysz);
@@ -1216,8 +1216,8 @@ typedef struct BTScanOpaqueData
 	BTScanPosData markPos;		/* marked position, if any */
 
 	/* Merge information */
-	BTScanInsert    mergeBoundaryKey;     /* Pre-built insertion scan key */ 
-	IndexTuple      mergeBoundaryItup;
+	BTScanInsert mergeBoundaryKey;	/* Pre-built insertion scan key */
+	IndexTuple	mergeBoundaryItup;
 	BlockNumber mergeBoundaryBlkno; /* L the boundary key was loaded from */
 
 	/*

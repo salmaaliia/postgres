@@ -123,7 +123,7 @@ typedef struct ua_merge_candidates
 	int			num_pages;
 	int			returned;
 
-}			ua_merge_candidates;
+} ua_merge_candidates;
 
 /*
  * State for bt_merge_detail(): holds the three block numbers of the
@@ -138,7 +138,7 @@ typedef struct ua_merge_detail
 	int			call_cntr;		/* 0=parent, 1=left, 2=right */
 	bool		show_tids;
 	TupleDesc	tupd;
-}			ua_merge_detail;
+} ua_merge_detail;
 
 /* -------------------------------------------------
  * GetBTPageStatistics()
@@ -1062,7 +1062,7 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 	bool		nulls[5];
 	HeapTuple	tuple;
 	bool		heapkeyspace;
-    bool		allequalimage;
+	bool		allequalimage;
 
 	if (!superuser())
 		ereport(ERROR,
@@ -1086,15 +1086,15 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		if (!IS_INDEX(rel) || !IS_BTREE(rel))
 			ereport(ERROR, (errcode(ERRCODE_WRONG_OBJECT_TYPE),
 							errmsg("\"%s\" is not a %s index",
-									RelationGetRelationName(rel), "btree")));
+								   RelationGetRelationName(rel), "btree")));
 
 		_bt_metaversion(rel, &heapkeyspace, &allequalimage);
 		if (!heapkeyspace)
 			ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("cannot merge pages of index \"%s\" because it is a version 3 or older btree",
-									RelationGetRelationName(rel)),
-						 errhint("Use REINDEX to upgrade the index first.")));
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot merge pages of index \"%s\" because it is a version 3 or older btree",
+							RelationGetRelationName(rel)),
+					 errhint("Use REINDEX to upgrade the index first.")));
 
 		mctx = MemoryContextSwitchTo(fctx->multi_call_memory_ctx);
 		uargs = palloc_object(ua_merge_candidates);
@@ -1217,7 +1217,10 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 					IndexTuple	first_itup = (IndexTuple) PageGetItem(leftpage,
 																	  PageGetItemId(leftpage, first_data_off));
 
-					/* The key must not point into L's buffer, which is released below */
+					/*
+					 * The key must not point into L's buffer, which is
+					 * released below
+					 */
 					keytuple = CopyIndexTuple(first_itup);
 					scankey = _bt_mkscankey(rel, keytuple);
 				}
@@ -1418,7 +1421,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 
 		/* Copy it: the key must not point into L's buffer after the release */
 		first_itup = CopyIndexTuple((IndexTuple) PageGetItem(
-											  leftpage, PageGetItemId(leftpage, first_data_off)));
+															 leftpage, PageGetItemId(leftpage, first_data_off)));
 
 		/*
 		 * Build a typed scan key from the tuple using the relation schema.
@@ -1475,8 +1478,8 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 			maxoff = PageGetMaxOffsetNumber(parentpage);
 
 			/*
-			 * On a page that is not rightmost, offset 1 is the high key, not a
-			 * downlink.  Start after it to scan only downlinks.
+			 * On a page that is not rightmost, offset 1 is the high key, not
+			 * a downlink.  Start after it to scan only downlinks.
 			 */
 			{
 				BTPageOpaque pOpaque = BTPageGetOpaque(parentpage);

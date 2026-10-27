@@ -256,8 +256,8 @@ _bt_killitems(IndexScanDesc scan)
 	opaque = BTPageGetOpaque(page);
 
 	/*
-	 * bt_merge() can convert a page to BTP_MERGED_AWAY while we hold a
-	 * pin but no lock.  The original tuples are gone; give up on hinting.
+	 * bt_merge() can convert a page to BTP_MERGED_AWAY while we hold a pin
+	 * but no lock.  The original tuples are gone; give up on hinting.
 	 */
 	if (P_ISMERGEDAWAY(opaque))
 		goto unlock_page;

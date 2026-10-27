@@ -115,16 +115,16 @@ static bool _bt_verify_keys_with_arraykeys(IndexScanDesc scan);
 static int
 _bt_posting_upper_bound(IndexTuple itup, ItemPointer boundary)
 {
-	int low = 0;
-	int high = BTreeTupleGetNPosting(itup),
-	res;
+	int			low = 0;
+	int			high = BTreeTupleGetNPosting(itup),
+				res;
 
 	Assert(BTreeTupleIsPosting(itup));
 	Assert(high >= 2);
 
 	while (low < high)
 	{
-		int mid = low + (high - low) / 2;
+		int			mid = low + (high - low) / 2;
 
 		res = ItemPointerCompare(BTreeTupleGetPostingN(itup, mid), boundary);
 
@@ -223,7 +223,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 		if (ScanDirectionIsForward(dir))
 			_bt_parallel_release(scan, so->currPos.nextPage,
 								 so->currPos.currPage);
-		else if(!so->currPos.needMergeRecovery)
+		else if (!so->currPos.needMergeRecovery)
 			_bt_parallel_release(scan, so->currPos.prevPage,
 								 so->currPos.currPage);
 	}
@@ -309,18 +309,21 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 
 			if (passes_quals)
 			{
-				if(P_ISMERGED(opaque) && so->currPos.needMergeRecovery)
+				if (P_ISMERGED(opaque) && so->currPos.needMergeRecovery)
 				{
-					int cmp;
+					int			cmp;
 
 					Assert(so->mergeBoundaryKey != NULL);
 					cmp = _bt_compare(rel, so->mergeBoundaryKey, page, offnum);
 
-					/* cmp > 0 is a tuple from L: save it for a direction turn, but don't start there */
+					/*
+					 * cmp > 0 is a tuple from L: save it for a direction
+					 * turn, but don't start there
+					 */
 
 					if (cmp == 0)
 					{
-						if(!BTreeTupleIsPosting(itup))
+						if (!BTreeTupleIsPosting(itup))
 						{
 							/* Crossed the boundary! Shut off recovery */
 							so->currPos.needMergeRecovery = false;
@@ -330,9 +333,9 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 						}
 						else
 						{
-							int posStart = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
+							int			posStart = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
 
-							if(posStart < BTreeTupleGetNPosting(itup))
+							if (posStart < BTreeTupleGetNPosting(itup))
 							{
 								/* Crossed the boundary! Shut off recovery */
 								so->currPos.needMergeRecovery = false;
@@ -346,16 +349,16 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 					{
 
 						/*
-						 * Boundary < Tuple: this tuple is strictly after the boundary.
-						 * Belongs to R; forward scan has not seen it yet. Keep whole tuple
-						 * and shut off recovery
+						 * Boundary < Tuple: this tuple is strictly after the
+						 * boundary. Belongs to R; forward scan has not seen
+						 * it yet. Keep whole tuple and shut off recovery
 						 */
 						so->currPos.needMergeRecovery = false;
 						_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
 						startIndex = itemIndex;
 					}
 				}
-				
+
 				/* tuple passes all scan key conditions */
 				if (!BTreeTupleIsPosting(itup))
 				{
@@ -548,23 +551,27 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 
 			if (passes_quals && tuple_alive)
 			{
-				int cmp;
+				int			cmp;
 
-				if(P_ISMERGED(opaque) && so->currPos.needMergeRecovery && startIndex < 0)
+				if (P_ISMERGED(opaque) && so->currPos.needMergeRecovery && startIndex < 0)
 				{
 					Assert(so->mergeBoundaryKey != NULL);
 
 					cmp = _bt_compare(rel, so->mergeBoundaryKey, page, offnum);
 
-					if(cmp < 0)
+					if (cmp < 0)
 					{
-						/* Tuple from R: save it for a direction turn, but don't start there */
+						/*
+						 * Tuple from R: save it for a direction turn, but
+						 * don't start there
+						 */
 					}
-					else if ( cmp == 0 && BTreeTupleIsPosting(itup))
+					else if (cmp == 0 && BTreeTupleIsPosting(itup))
 					{
 						/* TIDs before nfromL came from L */
-						int nfromL = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
-						if(nfromL > 0)
+						int			nfromL = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
+
+						if (nfromL > 0)
 							startIndex = itemIndex - (BTreeTupleGetNPosting(itup) - nfromL + 1);
 					}
 					else

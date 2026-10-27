@@ -145,29 +145,32 @@ btree2_desc(StringInfo buf, XLogReaderState *record)
 	switch (info)
 	{
 		case XLOG_BTREE2_MERGE:
-		{
-			xl_btree_merge *xlrec = (xl_btree_merge *) rec;
-			appendStringInfo(buf,
-		        "merge pages: left_prev: %u, left_next: %u, "
-		        "poffset: %u, safexid: %u:%u",
-		        xlrec->left_prev, xlrec->left_next,
-		        xlrec->poffset,
-		        EpochFromFullTransactionId(xlrec->safemergexid),
-		        XidFromFullTransactionId(xlrec->safemergexid));
-		    break;
-		}
+			{
+				xl_btree_merge *xlrec = (xl_btree_merge *) rec;
+
+				appendStringInfo(buf,
+								 "merge pages: left_prev: %u, left_next: %u, "
+								 "poffset: %u, safexid: %u:%u",
+								 xlrec->left_prev, xlrec->left_next,
+								 xlrec->poffset,
+								 EpochFromFullTransactionId(xlrec->safemergexid),
+								 XidFromFullTransactionId(xlrec->safemergexid));
+				break;
+			}
 		case XLOG_BTREE2_CLEAR_MERGE_FLAG:
-		{	appendStringInfoString(buf, "clear merge flag");
-		    break;
-		}
+			{
+				appendStringInfoString(buf, "clear merge flag");
+				break;
+			}
 		case XLOG_BTREE2_MERGE_MARK_HALFDEAD:
-		{
-			xl_btree_mark_ma_hd *xlrec = (xl_btree_mark_ma_hd *) rec;
-			appendStringInfo(buf,
-		        "mark merged-away page half-dead: left: %u, right: %u",
-		        xlrec->left_prev, xlrec->left_next);
-		    break;
-		}
+			{
+				xl_btree_mark_ma_hd *xlrec = (xl_btree_mark_ma_hd *) rec;
+
+				appendStringInfo(buf,
+								 "mark merged-away page half-dead: left: %u, right: %u",
+								 xlrec->left_prev, xlrec->left_next);
+				break;
+			}
 	}
 }
 
@@ -229,7 +232,8 @@ btree_identify(uint8 info)
 }
 
 const char *
-btree2_identify(uint8 info){
+btree2_identify(uint8 info)
+{
 	const char *id = NULL;
 
 	switch (info & ~XLR_INFO_MASK)

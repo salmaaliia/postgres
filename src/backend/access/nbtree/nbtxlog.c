@@ -258,7 +258,7 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 	BlockNumber origpagenumber;
 	BlockNumber rightpagenumber;
 	BlockNumber spagenumber;
-	BlockNumber	merged_ma_blkno = xlrec->merged_ma_blkno;
+	BlockNumber merged_ma_blkno = xlrec->merged_ma_blkno;
 
 	XLogRecGetBlockTag(record, 0, NULL, NULL, &origpagenumber);
 	XLogRecGetBlockTag(record, 1, NULL, NULL, &rightpagenumber);
@@ -295,7 +295,8 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 	ropaque->btpo_flags = isleaf ? BTP_LEAF : 0;
 	ropaque->btpo_cycleid = 0;
 
-	if(BlockNumberIsValid(merged_ma_blkno)){
+	if (BlockNumberIsValid(merged_ma_blkno))
+	{
 		ropaque->btpo_flags |= BTP_MERGED;
 		BTMergedPageSetMABlkno(rpage, merged_ma_blkno);
 	}
@@ -422,7 +423,8 @@ btree_xlog_split(bool newitemonleft, XLogReaderState *record)
 		if (isleaf)
 			oopaque->btpo_flags |= BTP_LEAF;
 
-		if(BlockNumberIsValid(merged_ma_blkno)){
+		if (BlockNumberIsValid(merged_ma_blkno))
+		{
 			oopaque->btpo_flags |= BTP_MERGED;
 			BTMergedPageSetMABlkno(origpage, merged_ma_blkno);
 		}
@@ -502,6 +504,7 @@ btree_xlog_dedup(XLogReaderState *record)
 		if (BlockNumberIsValid(xlrec->merged_ma_blkno))
 		{
 			BTPageOpaque nopaque = BTPageGetOpaque(newpage);
+
 			nopaque->btpo_flags |= BTP_MERGED;
 			BTMergedPageSetMABlkno(newpage, xlrec->merged_ma_blkno);
 		}
@@ -729,7 +732,7 @@ btree_xlog_mark_page_halfdead(uint8 info, XLogReaderState *record)
 	Page		page;
 	BTPageOpaque pageop;
 	IndexTupleData trunctuple;
-	BlockNumber	merged_ma_blkno = xlrec->merged_ma_blkno;
+	BlockNumber merged_ma_blkno = xlrec->merged_ma_blkno;
 
 	/*
 	 * In normal operation, we would lock all the pages this WAL record
@@ -826,7 +829,7 @@ btree_xlog_unlink_page(uint8 info, XLogReaderState *record)
 	Buffer		rightbuf;
 	Page		page;
 	BTPageOpaque pageop;
-	BlockNumber	merged_ma_blkno = xlrec->merged_ma_blkno;
+	BlockNumber merged_ma_blkno = xlrec->merged_ma_blkno;
 
 	leftsib = xlrec->leftsib;
 	rightsib = xlrec->rightsib;
@@ -1053,11 +1056,11 @@ btree_xlog_merge_page(XLogReaderState *record)
 	char	   *boundary_pivot;
 	Size		boundary_sz;
 
-    /*
-     * Reconstruct left (MA) page from scratch.  Take a cleanup lock, as the
-     * merge did on the primary, so a standby scan that still holds L's items
-     * forces a recovery conflict instead of losing them.
-     */
+	/*
+	 * Reconstruct left (MA) page from scratch.  Take a cleanup lock, as the
+	 * merge did on the primary, so a standby scan that still holds L's items
+	 * forces a recovery conflict instead of losing them.
+	 */
 	XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_AND_CLEANUP_LOCK, true, &buf);
 	page = BufferGetPage(buf);
 
@@ -1133,16 +1136,16 @@ btree_xlog_clear_m_flag(XLogReaderState *record)
 	if (InHotStandby)
 	{
 		RelFileLocator rlocator;
-	
+
 		XLogRecGetBlockTag(record, 0, &rlocator, NULL, NULL);
-	
+
 		ResolveRecoveryConflictWithSnapshotFullXid(
-			xlrec->safemergexid,
-			xlrec->isCatalogRel,
-			rlocator);
+												   xlrec->safemergexid,
+												   xlrec->isCatalogRel,
+												   rlocator);
 	}
 
-	if(XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
+	if (XLogReadBufferForRedo(record, 0, &buf) == BLK_NEEDS_REDO)
 	{
 		page = BufferGetPage(buf);
 		pageop = BTPageGetOpaque(page);
@@ -1152,7 +1155,7 @@ btree_xlog_clear_m_flag(XLogReaderState *record)
 		MarkBufferDirty(buf);
 	}
 	if (BufferIsValid(buf))
-    	UnlockReleaseBuffer(buf);
+		UnlockReleaseBuffer(buf);
 }
 
 /* Redo marking a tombstone half-dead, after its group was cleaned up */
@@ -1173,16 +1176,16 @@ btree_xlog_mark_ma_hd(XLogReaderState *record)
 	if (InHotStandby)
 	{
 		RelFileLocator rlocator;
-	
+
 		XLogRecGetBlockTag(record, 0, &rlocator, NULL, NULL);
-	
+
 		ResolveRecoveryConflictWithSnapshotFullXid(
-			xlrec->safemergexid,
-			xlrec->isCatalogRel,
-			rlocator);
+												   xlrec->safemergexid,
+												   xlrec->isCatalogRel,
+												   rlocator);
 	}
 
-    /* Rewrite the MA page as a halfdead page */
+	/* Rewrite the MA page as a halfdead page */
 	buf = XLogInitBufferForRedo(record, 0);
 	page = BufferGetPage(buf);
 
@@ -1325,7 +1328,7 @@ btree_mask(char *pagedata, BlockNumber blkno)
 
 	maskopaq = BTPageGetOpaque(page);
 
-	if(P_ISMERGED(maskopaq))
+	if (P_ISMERGED(maskopaq))
 		phdr->pd_prune_xid = saved_prune_xid;
 
 	if (P_ISLEAF(maskopaq) && !P_ISMERGEDAWAY(maskopaq))

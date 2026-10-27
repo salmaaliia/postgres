@@ -50,7 +50,7 @@
  * are associated with RM_BTREE2_ID.
  */
 #define XLOG_BTREE2_MERGE					0x00
-#define XLOG_BTREE2_CLEAR_MERGE_FLAG			0x10	
+#define XLOG_BTREE2_CLEAR_MERGE_FLAG			0x10
 #define XLOG_BTREE2_MERGE_MARK_HALFDEAD		0x20
 
 /*
@@ -300,7 +300,8 @@ typedef struct xl_btree_mark_page_halfdead
 	BlockNumber leftblk;		/* leaf block's left sibling, if any */
 	BlockNumber rightblk;		/* leaf block's right sibling */
 	BlockNumber topparent;		/* topmost internal page in the subtree */
-	BlockNumber merged_ma_blkno;  /* leaf's MA block if leaf is M, else InvalidBlockNumber */
+	BlockNumber merged_ma_blkno;	/* leaf's MA block if leaf is M, else
+									 * InvalidBlockNumber */
 } xl_btree_mark_page_halfdead;
 
 #define SizeOfBtreeMarkPageHalfDead (offsetof(xl_btree_mark_page_halfdead, merged_ma_blkno) + sizeof(BlockNumber))
@@ -336,7 +337,8 @@ typedef struct xl_btree_unlink_page
 	BlockNumber leafleftsib;
 	BlockNumber leafrightsib;
 	BlockNumber leaftopparent;	/* next child down in the subtree */
-	BlockNumber merged_ma_blkno;  /* leaf's MA block if leaf is M, else InvalidBlockNumber */
+	BlockNumber merged_ma_blkno;	/* leaf's MA block if leaf is M, else
+									 * InvalidBlockNumber */
 
 	/* xl_btree_metadata FOLLOWS IF XLOG_BTREE_UNLINK_PAGE_META */
 } xl_btree_unlink_page;
@@ -365,8 +367,8 @@ typedef struct xl_btree_newroot
 
 typedef struct xl_btree_merge
 {
-	BlockNumber  left_prev;      /* L's left sibling */
-	BlockNumber  left_next;      /* L's right sibling, R */
+	BlockNumber left_prev;		/* L's left sibling */
+	BlockNumber left_next;		/* L's right sibling, R */
 	OffsetNumber poffset;		/* offset of L's downlink in parent */
 	FullTransactionId safemergexid;
 	/* block 0 (the tombstone) data: the boundary key */
@@ -376,15 +378,15 @@ typedef struct xl_btree_merge
 typedef struct xl_btree_clear_m
 {
 	bool		isCatalogRel;	/* to handle recovery conflict during logical
-								* decoding on standby */
+								 * decoding on standby */
 	FullTransactionId safemergexid;
 } xl_btree_clear_m;
 #define SizeOfBtreeClearM 	(offsetof(xl_btree_clear_m, safemergexid) + sizeof(FullTransactionId))
 
 typedef struct xl_btree_mark_ma_hd
 {
-	BlockNumber  left_prev;      /* tombstone's left sibling */
-	BlockNumber  left_next;      /* tombstone's right sibling */
+	BlockNumber left_prev;		/* tombstone's left sibling */
+	BlockNumber left_next;		/* tombstone's right sibling */
 	bool		isCatalogRel;	/* to handle recovery conflict during logical
 								 * decoding on standby */
 	FullTransactionId safemergexid;

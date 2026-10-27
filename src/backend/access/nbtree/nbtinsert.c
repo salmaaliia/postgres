@@ -2025,7 +2025,7 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 		xl_btree_split xlrec = {0};
 		uint8		xlinfo;
 
-		xlrec.merged_ma_blkno = P_ISMERGED(oopaque)? BTMergedPageGetMABlkno(origpage): InvalidBlockNumber;
+		xlrec.merged_ma_blkno = P_ISMERGED(oopaque) ? BTMergedPageGetMABlkno(origpage) : InvalidBlockNumber;
 
 		xlrec.level = ropaque->btpo_level;
 		/* See comments below on newitem, orignewitem, and posting lists */

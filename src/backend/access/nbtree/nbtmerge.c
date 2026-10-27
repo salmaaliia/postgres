@@ -36,7 +36,7 @@ typedef struct BTMergeState
 	BlockNumber left_blkno;
 	BlockNumber right_blkno;
 	BTStack		stack;
-}			BTMergeState;
+} BTMergeState;
 
 
 static int32 _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_limit);
@@ -44,6 +44,7 @@ static bool _bt_mergepage(BTMergeState mstate);
 static BTScanInsert _bt_merge_mkscankey(Relation rel, Page page, BTPageOpaque opaque, IndexTuple *keytuple);
 static bool _bt_pages_mergeable(Page leftpage, Page rightpage, float8 min_threshold, float8 fillfactor);
 static IndexTuple _bt_build_boundary_pivot(Relation rel, IndexTuple itup);
+
 /*
  * _bt_merge_index() -- Entry point: merge underutilized leaf pages.
  *
@@ -56,15 +57,16 @@ static IndexTuple _bt_build_boundary_pivot(Relation rel, IndexTuple itup);
 int32
 _bt_merge_index(Relation rel, float8 min_pct, float8 dest_pct, int32 num_pages)
 {
-	bool	heapkeyspace;
-    bool	allequalimage;
+	bool		heapkeyspace;
+	bool		allequalimage;
+
 	_bt_metaversion(rel, &heapkeyspace, &allequalimage);
 	if (!heapkeyspace)
 		ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("cannot merge pages of index \"%s\" because it is a version 3 or older btree",
-								RelationGetRelationName(rel)),
-					 errhint("Use REINDEX to upgrade the index first.")));
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot merge pages of index \"%s\" because it is a version 3 or older btree",
+						RelationGetRelationName(rel)),
+				 errhint("Use REINDEX to upgrade the index first.")));
 
 	return _bt_mergescan(rel, min_pct, dest_pct, num_pages);
 }
@@ -163,7 +165,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 	BTScanInsert scankey;
 	BTMergeState mstate;
 	BTStack		stack;
-	IndexTuple      keytuple;
+	IndexTuple	keytuple;
 
 	mstate.rel = rel;
 	mstate.min_threshold = min_threshold / 100.0;
@@ -245,18 +247,18 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 			scankey != NULL)
 		{
 			/*
-			 * Advance to R's original right sibling (r_right_blkno), not to
-			 * R itself, leaving R untouched even if the merge below fails.
-			 * That way, if the failure was L being pinned, L can retry
-			 * against the same R next time.  A false return doesn't always
-			 * mean L was pinned; it can also mean one of the other
-			 * preconditions _bt_mergepage() rechecks failed.  Those should
-			 * be rare here, though, since we already checked the same
-			 * conditions above under share lock just before calling it.
+			 * Advance to R's original right sibling (r_right_blkno), not to R
+			 * itself, leaving R untouched even if the merge below fails. That
+			 * way, if the failure was L being pinned, L can retry against the
+			 * same R next time.  A false return doesn't always mean L was
+			 * pinned; it can also mean one of the other preconditions
+			 * _bt_mergepage() rechecks failed.  Those should be rare here,
+			 * though, since we already checked the same conditions above
+			 * under share lock just before calling it.
 			 *
 			 * Drop share locks before calling _bt_pages_share_parent().  It
-			 * descends via _bt_search and will try to lock these same
-			 * blocks itself.
+			 * descends via _bt_search and will try to lock these same blocks
+			 * itself.
 			 */
 			num_pages++;
 			current_blkno = r_right_blkno;
@@ -342,7 +344,7 @@ _bt_mergepage(BTMergeState mstate)
 	FullTransactionId safemergexid;
 	bool		merged = false;
 	XLogRecPtr	recptr;
-	BTCycleId   cycleid;
+	BTCycleId	cycleid;
 
 	parent_blkno = stack->bts_blkno;
 
@@ -350,10 +352,10 @@ _bt_mergepage(BTMergeState mstate)
 	 * Insist on a cleanup lock for L, not just BT_WRITE.  Index-only scans
 	 * (and plain scans on a non-MVCC snapshot) keep their pin on a leaf page
 	 * the whole time they're using its cached entries, trusting that pin to
-	 * stop VACUUM from recycling anything underneath them.  Moving L's
-	 * tuples into R without checking for that pin would defeat it: the
-	 * scan's pin stays on an empty tombstone while the data it's protecting
-	 * quietly becomes R's problem, where nothing knows it needs protecting.
+	 * stop VACUUM from recycling anything underneath them.  Moving L's tuples
+	 * into R without checking for that pin would defeat it: the scan's pin
+	 * stays on an empty tombstone while the data it's protecting quietly
+	 * becomes R's problem, where nothing knows it needs protecting.
 	 *
 	 * Use the conditional (non-blocking) form: a contended pin just means
 	 * this pair isn't ready yet, not that bt_merge() should wait for it.
@@ -389,7 +391,7 @@ _bt_mergepage(BTMergeState mstate)
 	if (!_bt_pages_mergeable(leftpage, rightpage,
 							 mstate.min_threshold, mstate.fillfactor))
 		goto unlock_leaf_bufs;
-	
+
 	if (PageGetMaxOffsetNumber(leftpage) < P_FIRSTDATAKEY(leftopaque) ||
 		PageGetMaxOffsetNumber(rightpage) < P_FIRSTDATAKEY(rightopaque))
 		goto unlock_leaf_bufs;
@@ -467,16 +469,16 @@ _bt_mergepage(BTMergeState mstate)
 	 */
 	cycleid = _bt_vacuum_cycleid(rel);
 
-	itup	= (IndexTuple) PageGetItem(leftpage, 
-										PageGetItemId(leftpage, PageGetMaxOffsetNumber(leftpage)));
-	boundary_pivot	=	_bt_build_boundary_pivot(rel, itup);
+	itup = (IndexTuple) PageGetItem(leftpage,
+									PageGetItemId(leftpage, PageGetMaxOffsetNumber(leftpage)));
+	boundary_pivot = _bt_build_boundary_pivot(rel, itup);
 
 	/*
 	 * Any failure across the three-buffer update (L becomes a tombstone, R
 	 * absorbs all tuples, parent loses R's downlink) would leave the index in
 	 * an inconsistent state.  Perform all three modifications as an atomic
 	 * unit inside a critical section so that any error panics the server
-	 * rather than aborting with a partially updated index. 
+	 * rather than aborting with a partially updated index.
 	 */
 	START_CRIT_SECTION();
 
@@ -543,7 +545,7 @@ _bt_mergepage(BTMergeState mstate)
 	MarkBufferDirty(rightbuf);
 	MarkBufferDirty(parentbuf);
 
-	if(RelationNeedsWAL(rel))
+	if (RelationNeedsWAL(rel))
 	{
 		xl_btree_merge xlrec = {0};
 
@@ -567,9 +569,9 @@ _bt_mergepage(BTMergeState mstate)
 	else
 		recptr = XLogGetFakeLSN(rel);
 
-	PageSetLSN(leftpage,   recptr);
-    PageSetLSN(rightpage,  recptr);
-    PageSetLSN(parentpage, recptr);
+	PageSetLSN(leftpage, recptr);
+	PageSetLSN(rightpage, recptr);
+	PageSetLSN(parentpage, recptr);
 
 
 	END_CRIT_SECTION();
@@ -604,22 +606,22 @@ unlock_leaf_bufs:
 static IndexTuple
 _bt_build_boundary_pivot(Relation rel, IndexTuple itup)
 {
-	TupleDesc	itupdesc	= RelationGetDescr(rel);
-	int16		nkeyatt		= IndexRelationGetNumberOfKeyAttributes(rel);
+	TupleDesc	itupdesc = RelationGetDescr(rel);
+	int16		nkeyatt = IndexRelationGetNumberOfKeyAttributes(rel);
 	IndexTuple	pivot;
 	IndexTuple	tidpivot;
 	Size		newsize;
 
-	pivot	=	index_truncate_tuple(itupdesc, itup, nkeyatt);
+	pivot = index_truncate_tuple(itupdesc, itup, nkeyatt);
 
-	if(BTreeTupleIsPosting(pivot))
+	if (BTreeTupleIsPosting(pivot))
 	{
 		pivot->t_info &= ~INDEX_SIZE_MASK;
 		pivot->t_info |= MAXALIGN(BTreeTupleGetPostingOffset(itup));
 	}
 
-	newsize	=	MAXALIGN(IndexTupleSize(pivot)) + MAXALIGN(sizeof(ItemPointerData));
-	tidpivot 	= palloc0(newsize);
+	newsize = MAXALIGN(IndexTupleSize(pivot)) + MAXALIGN(sizeof(ItemPointerData));
+	tidpivot = palloc0(newsize);
 	memcpy(tidpivot, pivot, MAXALIGN(IndexTupleSize(pivot)));
 	pfree(pivot);
 

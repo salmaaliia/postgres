@@ -74,7 +74,7 @@ typedef struct BTParallelScanDescData
 	BlockNumber btps_nextScanPage;	/* next page to be scanned */
 	BlockNumber btps_lastCurrPage;	/* page whose sibling link was copied into
 									 * btps_nextScanPage */
-	BlockNumber btps_skipMABlkno; 	/* MA tombstone blkno skipped by a worker */
+	BlockNumber btps_skipMABlkno;	/* MA tombstone blkno skipped by a worker */
 	BTPS_State	btps_pageStatus;	/* indicates whether next page is
 									 * available for scan. see above for
 									 * possible states of parallel scan. */
@@ -1758,9 +1758,10 @@ backtrack:
 				BTMergedPageClearMABlkno(bwd_page);
 				MarkBufferDirty(bwd_buf);
 
-				if(RelationNeedsWAL(rel))
+				if (RelationNeedsWAL(rel))
 				{
 					xl_btree_clear_m xlrec = {0};
+
 					xlrec.safemergexid = safemergexid;
 					xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
 
@@ -1775,7 +1776,7 @@ backtrack:
 				else
 					recptr = XLogGetFakeLSN(rel);
 
-				PageSetLSN(bwd_page,   recptr);
+				PageSetLSN(bwd_page, recptr);
 
 				END_CRIT_SECTION();
 
@@ -1831,9 +1832,10 @@ backtrack:
 			MarkBufferDirty(buf);
 
 
-			if(RelationNeedsWAL(rel))
+			if (RelationNeedsWAL(rel))
 			{
 				xl_btree_mark_ma_hd xlrec = {0};
+
 				xlrec.left_prev = opaque->btpo_prev;
 				xlrec.left_next = opaque->btpo_next;
 				xlrec.safemergexid = safemergexid;
@@ -1850,7 +1852,7 @@ backtrack:
 			else
 				recptr = XLogGetFakeLSN(rel);
 
-			PageSetLSN(page,   recptr);
+			PageSetLSN(page, recptr);
 
 			END_CRIT_SECTION();
 
@@ -1876,7 +1878,7 @@ backtrack:
 		 * deletable tuples --- see nbtree/README.
 		 */
 		_bt_upgradelockbufcleanup(rel, buf);
-		
+
 		Assert(!P_ISMERGEDAWAY(opaque));
 
 		/*
@@ -2207,11 +2209,11 @@ _bt_parallel_set_skip_ma(IndexScanDesc scan, BlockNumber blkno)
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
 	BTParallelScanDesc btscan;
 
-	if(scan->parallel_scan == NULL)
+	if (scan->parallel_scan == NULL)
 		return;
 
 	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
-											  parallel_scan->ps_offset_am);
+												  parallel_scan->ps_offset_am);
 
 	LWLockAcquire(&btscan->btps_lock, LW_EXCLUSIVE);
 	btscan->btps_skipMABlkno = blkno;
@@ -2229,14 +2231,13 @@ _bt_parallel_get_skip_ma(IndexScanDesc scan)
 	BTParallelScanDesc btscan;
 	BlockNumber blkno;
 
-	if(!scan->parallel_scan)
+	if (!scan->parallel_scan)
 		return InvalidBlockNumber;
 
 	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
-											  parallel_scan->ps_offset_am);
+												  parallel_scan->ps_offset_am);
 	LWLockAcquire(&btscan->btps_lock, LW_SHARED);
-	blkno =  btscan->btps_skipMABlkno;
+	blkno = btscan->btps_skipMABlkno;
 	LWLockRelease(&btscan->btps_lock);
 	return blkno;
 }
-

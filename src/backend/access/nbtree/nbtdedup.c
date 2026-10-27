@@ -252,7 +252,7 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 
 		xlrec_dedup.nintervals = state->nintervals;
 
-		xlrec_dedup.merged_ma_blkno = P_ISMERGED(opaque)? BTMergedPageGetMABlkno(page): InvalidBlockNumber;
+		xlrec_dedup.merged_ma_blkno = P_ISMERGED(opaque) ? BTMergedPageGetMABlkno(page) : InvalidBlockNumber;
 
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_STANDARD);
