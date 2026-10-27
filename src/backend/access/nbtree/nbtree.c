@@ -2196,7 +2196,12 @@ bttranslatecmptype(CompareType cmptype, Oid opfamily)
 	}
 }
 
-void                                                                                              
+/*
+ * Store in the shared parallel scan state the tombstone of the merge group a
+ * process has passed.  Other processes use it to tell whether L's tuples were
+ * already returned.  Does nothing for a serial scan.
+ */
+void
 _bt_parallel_set_skip_ma(IndexScanDesc scan, BlockNumber blkno)
 {
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
@@ -2213,7 +2218,12 @@ _bt_parallel_set_skip_ma(IndexScanDesc scan, BlockNumber blkno)
 	LWLockRelease(&btscan->btps_lock);
 }
 
-BlockNumber _bt_parallel_get_skip_ma(IndexScanDesc scan)
+/*
+ * Return the tombstone stored by _bt_parallel_set_skip_ma(), or
+ * InvalidBlockNumber for a serial scan.
+ */
+BlockNumber
+_bt_parallel_get_skip_ma(IndexScanDesc scan)
 {
 	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
 	BTParallelScanDesc btscan;

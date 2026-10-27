@@ -3146,6 +3146,12 @@ _bt_pendingfsm_add(BTVacState *vstate,
 	vstate->npendingpages++;
 }
 
+/*
+ * Return true if leaf pages left_blkno and right_blkno have the same parent,
+ * with the left page's downlink right before the right page's.  scankey must
+ * find the left page.  If stack_out is not NULL, the descent stack is
+ * returned in it, for the caller to free.
+ */
 bool
 _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 					   BlockNumber right_blkno, BTScanInsert scankey, BTStack *stack_out)
@@ -3203,9 +3209,7 @@ _bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
 	{
 		found_left = true;
 	}
-	/**
-	 * check if off + 1 in the parent is the right sibling
-	 */
+	/* Check that the next downlink in the parent points to the right sibling */
 	if (found_left)
 	{
 		OffsetNumber next_off = OffsetNumberNext(left_off);

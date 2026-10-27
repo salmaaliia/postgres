@@ -2050,9 +2050,9 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 				 */
 				if (MRead || so->currPos.needMergeRecovery)
 				{
-					/**
+					/*
 					 * We either already read the merged page or we just finished walking
-					 * backward through the recovery group In either case, we safely skip
+					 * backward through the recovery group.  In either case, we safely skip
 					 * this tombstone and step left.
 					 */
 					blkno = opaque->btpo_prev;
@@ -2183,11 +2183,11 @@ _bt_readnextpage(IndexScanDesc scan, BlockNumber blkno,
 	return true;
 }
 
-/*                                                                                                
- * _bt_load_boundary_from_ma() -- Read the merge boundary from the MA tombstone                      
- *  page and load it into so->boundaryKey.                          
- */  
-
+/*
+ * _bt_load_boundary_from_ma() -- Read the merge boundary from the MA tombstone
+ * page and load it into so->mergeBoundaryKey.  Also turns on the merged page
+ * filter (needMergeRecovery).
+ */
 static void
 _bt_load_boundary_from_ma(IndexScanDesc scan, Buffer mabuf)
 {
@@ -2227,7 +2227,8 @@ _bt_load_boundary_from_ma(IndexScanDesc scan, Buffer mabuf)
  * (needMergeRecovery), it must walk forward from the first MERGED page (R)
  * to locate the rightmost page in the merge group (the "tail").  This is
  * needed so the backward scan can restart from the tail and walk backward
- * through the full merge group, deduplicating against savedMergeTids.
+ * through the full merge group, returning only tuples at or below the
+ * boundary key.
  *
  * ma_blkno is the MERGED_AWAY tombstone and m_blkno is its right sibling,
  * normally the first MERGED page.  On return, *blkno is set to the

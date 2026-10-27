@@ -293,7 +293,7 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
 }
 
 
-/**
+/*
  * _bt_mergepage() -- Perform one leaf-page merge.
  *
  * Re-acquires exclusive locks on L, R, and their parent, re-verifies all
@@ -306,9 +306,9 @@ _bt_mergescan(Relation rel, float8 min_threshold, float8 fillfactor, int pages_l
  *      now-redundant downlink entry from the parent.
  *   5. Marks R as BTP_MERGED, recording L's block number in R's pd_prune_xid
  *      field so backward scans can identify the merge group tombstone.
- *   6. Marks L as BTP_MERGED_AWAY, recording the boundary between L and R (pivot tuple) 
- * 		and a safemergexid so VACUUM can determine when the tombstone page 
- * 		is safe to reclaim.
+ *   6. Marks L as BTP_MERGED_AWAY, recording the boundary between L and R
+ *      (a pivot tuple) and a safemergexid, so VACUUM can tell when the
+ *      tombstone is safe to reclaim.
  *
  * Returns true if the merge completed, false if any precondition failed.
  */
@@ -596,7 +596,11 @@ unlock_leaf_bufs:
 	return merged;
 }
 
-
+/*
+ * Build the boundary key stored on the tombstone from L's last tuple: its key
+ * columns plus its largest heap TID.  Scans compare tuples on the merged page
+ * with it, to tell L's tuples from R's.
+ */
 static IndexTuple
 _bt_build_boundary_pivot(Relation rel, IndexTuple itup)
 {

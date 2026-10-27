@@ -365,14 +365,11 @@ typedef struct xl_btree_newroot
 
 typedef struct xl_btree_merge
 {
-	BlockNumber  left_prev;      /* L's left sibling (for btpo_prev of MA page) */
-	BlockNumber  left_next;      /* L's right sibling (for btpo_prev of MA page) */ 
+	BlockNumber  left_prev;      /* L's left sibling */
+	BlockNumber  left_next;      /* L's right sibling, R */
 	OffsetNumber poffset;		/* offset of L's downlink in parent */
 	FullTransactionId safemergexid;
-	/*
-	 * In payload of blk 0 (leftbuf / MA page): 
-	 * - boundary_pivot
-	 */
+	/* block 0 (the tombstone) data: the boundary key */
 } xl_btree_merge;
 #define SizeOfBtreeMerge	(offsetof(xl_btree_merge, safemergexid) + sizeof(FullTransactionId))
 
@@ -386,8 +383,8 @@ typedef struct xl_btree_clear_m
 
 typedef struct xl_btree_mark_ma_hd
 {
-	BlockNumber  left_prev;      /* L's left sibling (for btpo_prev of MA page) */
-	BlockNumber  left_next;      /* L's right sibling (for btpo_prev of MA page) */ 
+	BlockNumber  left_prev;      /* tombstone's left sibling */
+	BlockNumber  left_next;      /* tombstone's right sibling */
 	bool		isCatalogRel;	/* to handle recovery conflict during logical
 								 * decoding on standby */
 	FullTransactionId safemergexid;

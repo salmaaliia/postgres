@@ -3611,7 +3611,10 @@ BTreeTupleGetPointsToTID(IndexTuple itup)
 	return &itup->t_tid;
 }
 
-
+/*
+ * Check a tombstone (BTP_MERGED_AWAY) page: its flags, its right sibling and
+ * its safemergexid.
+ */
 static void
 bt_check_ma_page(BtreeCheckState *state)
 {
@@ -3653,6 +3656,11 @@ bt_check_ma_page(BtreeCheckState *state)
 						block, RelationGetRelationName(state->rel))));
 }
 
+/*
+ * Check a merged (BTP_MERGED) page: it must point to a valid tombstone.  In
+ * readonly mode, also check that the tombstone is one, and that a merged right
+ * sibling points to the same tombstone.
+ */
 static void
 bt_check_m_page(BtreeCheckState *state)
 {

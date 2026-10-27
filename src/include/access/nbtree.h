@@ -83,8 +83,8 @@ typedef BTPageOpaqueData *BTPageOpaque;
 #define BTP_HAS_GARBAGE (1 << 6)	/* page has LP_DEAD tuples (deprecated) */
 #define BTP_INCOMPLETE_SPLIT (1 << 7)	/* right sibling's downlink is missing */
 #define BTP_HAS_FULLXID	(1 << 8)	/* contains BTDeletedPageData */
-#define BTP_MERGED		(1 << 9)	/* This node contain its lift sibling data */
-#define BTP_MERGED_AWAY	(1 << 10)	/* This node was merged into its right
+#define BTP_MERGED		(1 << 9)	/* holds its left sibling's tuples */
+#define BTP_MERGED_AWAY	(1 << 10)	/* tombstone, tuples moved to right
 									 * sibling */
 
 /*
@@ -1470,10 +1470,9 @@ extern IndexBuildResult *btbuild(Relation heap, Relation index,
 								 struct IndexInfo *indexInfo);
 extern void _bt_parallel_build_main(dsm_segment *seg, shm_toc *toc);
 
-/**
- * prototypes for functions in nbmerge.c
+/*
+ * prototypes for functions in nbtmerge.c
  */
-
 extern int32 _bt_merge_index(Relation rel, float8 min_pct, float8 dest_pct, int32 num_pages);
 
 

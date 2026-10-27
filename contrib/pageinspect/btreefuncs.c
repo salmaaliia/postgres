@@ -110,7 +110,7 @@ typedef struct ua_page_items
 	TupleDesc	tupd;
 } ua_page_items;
 
-/**
+/*
  * cross-call data structure for SRF for merge candidates
  */
 typedef struct ua_merge_candidates
@@ -1432,7 +1432,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		/*
 		 * Step 3: Verify that Right is also a child of the same parent.
 		 *
-		 * Adjacent leaf siblings do NOT always share the same parent — they
+		 * Adjacent leaf siblings do not always share the same parent.  They
 		 * can straddle a parent-page boundary after a split.  Instead of a
 		 * second O(log N) descent, we simply scan the parent page we already
 		 * have: if right_blkno does not appear as a downlink there, the two
@@ -1452,10 +1452,8 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 			maxoff = PageGetMaxOffsetNumber(parentpage);
 
 			/*
-			 * For non-rightmost pages, offset 1 is the HIGH KEY — its t_tid
-			 * holds the separator key's downlink to the adjacent page, NOT a
-			 * child of this page.  Start from offset 2 to scan only real
-			 * downlinks.
+			 * On a page that is not rightmost, offset 1 is the high key, not a
+			 * downlink.  Start after it to scan only downlinks.
 			 */
 			{
 				BTPageOpaque pOpaque = BTPageGetOpaque(parentpage);
@@ -1704,6 +1702,13 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 	}
 }
 
+/*
+ * bt_merge(relname, merge_candidate_max_pct, merge_destination_max_pct,
+ *          num_pages)
+ *
+ * Merge nearly empty leaf pages of a B-tree index into their right sibling.
+ * This changes the index.  Returns the number of merges done.
+ */
 Datum
 bt_merge(PG_FUNCTION_ARGS)
 {

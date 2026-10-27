@@ -1039,6 +1039,7 @@ btree_xlog_reuse_page(XLogReaderState *record)
 												   xlrec->locator);
 }
 
+/* Redo a merge: L becomes a tombstone, R gets L's tuples, parent updated */
 static void
 btree_xlog_merge_page(XLogReaderState *record)
 {
@@ -1114,8 +1115,11 @@ btree_xlog_merge_page(XLogReaderState *record)
 		UnlockReleaseBuffer(rbuf);
 	UnlockReleaseBuffer(buf);
 }
+
+/* Redo clearing the merged flag on one page of a merge group */
 static void
-btree_xlog_clear_m_flag(XLogReaderState *record){
+btree_xlog_clear_m_flag(XLogReaderState *record)
+{
 	xl_btree_clear_m *xlrec = (xl_btree_clear_m *) XLogRecGetData(record);
 	XLogRecPtr	lsn = record->EndRecPtr;
 	Buffer		buf;
@@ -1151,8 +1155,10 @@ btree_xlog_clear_m_flag(XLogReaderState *record){
     	UnlockReleaseBuffer(buf);
 }
 
+/* Redo marking a tombstone half-dead, after its group was cleaned up */
 static void
-btree_xlog_mark_ma_hd(XLogReaderState *record){
+btree_xlog_mark_ma_hd(XLogReaderState *record)
+{
 	xl_btree_mark_ma_hd *xlrec = (xl_btree_mark_ma_hd *) XLogRecGetData(record);
 	XLogRecPtr	lsn = record->EndRecPtr;
 	Buffer		buf;
