@@ -998,15 +998,38 @@ bt_metap(PG_FUNCTION_ARGS)
 }
 
 
+/*
+ * Check the arguments shared by bt_find_merge_candidates() and bt_merge().
+ */
+static void
+check_merge_args(float8 candidate_max_pct, float8 destination_max_pct,
+				 int32 num_pages)
+{
+	/* written this way so that NaN is rejected too */
+	if (!(candidate_max_pct >= 0 && candidate_max_pct <= 100))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("merge_candidate_max_pct must be between 0 and 100")));
+	if (!(destination_max_pct >= 0 && destination_max_pct <= 100))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("merge_destination_max_pct must be between 0 and 100")));
+	if (num_pages < 1)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("num_pages must be at least 1")));
+}
+
 /*-------------------------------------------------------
  * bt_find_merge_candidates()
  *
  * Scan the B-tree leaf chain left-to-right and return up to num_pages
- * LEFT block numbers of adjacent leaf pairs where both pages are at most
- * min_pct_threshold percent full and their combined content fits within
- * the target fillfactor.  Only merge candidates are returned.
+ * adjacent leaf pairs where both pages are at most merge_candidate_max_pct
+ * percent full and their combined content is at most
+ * merge_destination_max_pct percent of a page.  Only merge candidates are
+ * returned.
  *
- * Usage: SELECT * FROM bt_find_merge_candidates('t1_pkey', 50.0, 5);
+ * Usage: SELECT * FROM bt_find_merge_candidates('t1_pkey', 10.0, 90.0, 5);
  *-------------------------------------------------------
  */
 Datum
@@ -1045,6 +1068,9 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to use pageinspect functions")));
+
+	check_merge_args(merge_candidate_max_pct, merge_destination_max_pct,
+					 num_pages);
 
 	if (SRF_IS_FIRSTCALL())
 	{
@@ -1085,7 +1111,6 @@ bt_find_merge_candidates(PG_FUNCTION_ARGS)
 				BTPageOpaque temp_opaque = BTPageGetOpaque(temp_page);
 
 				uargs->current_blkno = temp_opaque->btpo_next;
-				/* elog(WARNING, "Hello from bt_find_merge_candidates"); */
 				UnlockReleaseBuffer(endpoint_buf);
 			}
 			else
@@ -1300,8 +1325,6 @@ index_tuple_data(IndexTuple itup)
  * pages the array holds heap TIDs (posting-list entries are expanded).
  * For the parent page the array holds the child downlinks encoded as TIDs.
  *
- * merge_id is reserved for future use and is always NULL.
- *
  * Usage: SELECT * FROM bt_merge_detail('t1_pkey', 5, false);
  *-------------------------------------------------------
  */
@@ -1380,7 +1403,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 			ereport(
 					ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("block %u is the rightmost leaf it has no right sibling",
+					 errmsg("block %u is the rightmost leaf page, so it has no right sibling",
 							left_blkno)));
 
 		/*
@@ -1390,7 +1413,7 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		first_data_off = P_FIRSTDATAKEY(leftopaque);
 		if (first_data_off > PageGetMaxOffsetNumber(leftpage))
 			ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("leaf page %u is empty cannot determine parent",
+							errmsg("leaf page %u is empty, so its parent cannot be found",
 								   left_blkno)));
 
 		/* Copy it: the key must not point into L's buffer after the release */
@@ -1540,8 +1563,8 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 		ItemPointerData *tids_buf;
 		int			ntids = 0;
 		Datum	   *tids_datum;
-		Datum		values[14];
-		bool		nulls[14];
+		Datum		values[13];
+		bool		nulls[13];
 		int			j;
 		HeapTuple	tuple;
 		Datum		result;
@@ -1687,8 +1710,6 @@ bt_merge_detail(PG_FUNCTION_ARGS)
 			values[j++] = CStringGetTextDatum(last_val_hex);
 		else
 			nulls[j++] = true;
-		nulls[j++] = true;		/* merge_id: RFU, always NULL */
-
 		if (uargs->show_tids)
 			values[j++] = PointerGetDatum(construct_array_builtin(tids_datum, ntids, TIDOID));
 		else
@@ -1725,6 +1746,9 @@ bt_merge(PG_FUNCTION_ARGS)
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
 				 errmsg("must be superuser to use pageinspect functions")));
+
+	check_merge_args(merge_candidate_max_pct, merge_destination_max_pct,
+					 num_pages);
 
 	if (RecoveryInProgress())
 		ereport(ERROR,

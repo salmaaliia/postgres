@@ -4,11 +4,12 @@
 \echo Use "ALTER EXTENSION pageinspect UPDATE TO '1.14'" to load this file. \quit
 
 --
--- bt_find_merge_candidates(relname, min_pct_threshold, num_pages)
+-- bt_find_merge_candidates(relname, merge_candidate_max_pct,
+--                          merge_destination_max_pct, num_pages)
 --
--- Scan the B-tree leaf chain and return up to num_pages LEFT block numbers
--- of adjacent pairs that are merge candidates (both pages <= min_pct_threshold
--- percent full, and combined content fits within the target fillfactor).
+-- Scan the B-tree leaf chain and return up to num_pages adjacent pairs that
+-- are merge candidates (both pages <= merge_candidate_max_pct percent full,
+-- and together <= merge_destination_max_pct percent of a page).
 --
 CREATE FUNCTION bt_find_merge_candidates(
     IN  relname           text,
@@ -47,7 +48,6 @@ CREATE FUNCTION bt_merge_detail(
     OUT high_key    text,
     OUT first_val   text,
     OUT last_val    text,
-    OUT merge_id    int4,
     OUT tids        tid[]
 )
 RETURNS SETOF record
