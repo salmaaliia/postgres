@@ -121,6 +121,13 @@ $node->start;
 $node->safe_psql('postgres',
 	'CREATE EXTENSION amcheck; CREATE EXTENSION pageinspect');
 
+# Keep all WAL, so pg_waldump can still read the ranges this test records
+# after a checkpoint.  With wal_consistency_checking = all, every record has
+# a full page image, and checkpoints triggered by WAL volume would otherwise
+# recycle those segments.
+$node->safe_psql('postgres',
+	"SELECT pg_create_physical_replication_slot('keep_wal', true)");
+
 $node->safe_psql('postgres', $setup_sql);
 
 

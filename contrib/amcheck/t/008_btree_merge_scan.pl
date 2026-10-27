@@ -187,6 +187,27 @@ sub fill_bounds
 	return $where;
 }
 
+# Parallel workers launched so far in this database.  A query's leader
+# reports its workers when the query ends, and its stats are flushed when the
+# session exits.
+sub workers_launched
+{
+	return $node->safe_psql('postgres',
+		"SELECT parallel_workers_launched FROM pg_stat_database WHERE datname = 'postgres';"
+	);
+}
+
+# Wait until more parallel workers than $before have been launched.
+sub workers_ran
+{
+	my ($before, $name) = @_;
+	ok( $node->poll_query_until('postgres', qq[
+			SELECT parallel_workers_launched > $before
+			FROM pg_stat_database WHERE datname = 'postgres';
+		]),
+		"$name: parallel workers ran");
+}
+
 # Run $scan_query in a background psql, pause it at its first step to
 # another page, run bt_merge() (+ optional $post_sql) in another session,
 # resume, and compare the scan result to the heap result computed beforehand.
@@ -226,6 +247,8 @@ sub run_concurrent_scan
 	# inserts afterwards is invisible to that snapshot.
 	my $expected = heap_rows($where, $desc);
 	cmp_ok(scalar(@$expected), '>', 0, "$name: expected result is non-empty");
+
+	my $launched = workers_launched();
 
 	# Only scans of merge_test_idx stop, so other sessions never wait here.
 	$node->safe_psql('postgres',
@@ -286,6 +309,7 @@ sub run_concurrent_scan
 
 	$h->finish();
 	is($h->result(0), 0, "$name: scan exited cleanly") or diag($stderr);
+	workers_ran($launched, $name) if $parallel;
 
 	my @got = grep { /^-?\d+$/ } split(/\n/, $stdout);
 	is(scalar(@got), scalar(@$expected), "$name: row count matches heap");
@@ -340,6 +364,53 @@ $node->safe_psql('postgres',
 	"INSERT INTO merge_test SELECT generate_series(367, 367 + 500);");
 amcheck_ok('split on merged page');
 index_matches_heap('split on merged page', 'id >= 0');
+
+# ==============================================================================
+# SECTION 2b: rescans across a merged page
+# ==============================================================================
+#
+# A correlated subquery rescans the same index scan once for each outer row.
+# Each scan stops early because of the LIMIT, often inside the merge group or
+# in the middle of recovering L's tuples, and the next scan starts somewhere
+# else.  No merge state may survive a rescan.
+#
+note("SECTION 2b: rescans across a merged page");
+
+reset_table('sparse_10k');
+{
+	# Keys of the pages before the merge; afterwards block 2 is a tombstone.
+	my $fwd_starts = fill_bounds('{L_MIN}, 0, {R_MIN}, {L_MAX}, {R2_MIN}, {L_MIN}');
+	my $bwd_starts = fill_bounds('{R_MAX}, {R2_MAX}, {L_MAX}, {R_MIN}, {R2_MAX}');
+
+	cmp_ok($node->safe_psql('postgres',
+			"SELECT bt_merge('merge_test_idx', 10.0, 90.0, 10);"),
+		'>', 0, 'rescan: merge happened');
+	is( $node->safe_psql('postgres',
+			"SELECT btpo_flags & 1024 <> 0 FROM bt_page_stats('merge_test_idx', 2);"),
+		't',
+		'rescan: block 2 was merged into its right sibling');
+
+	for my $case ([ 'forward', '>=', 'ASC', $fwd_starts ],
+		[ 'backward', '<=', 'DESC', $bwd_starts ])
+	{
+		my ($name, $op, $dir, $starts) = @$case;
+		my $q = qq{
+			SELECT g, (SELECT string_agg(id::text, ',')
+					   FROM (SELECT id FROM merge_test WHERE id $op g
+							 ORDER BY id $dir LIMIT 25) s)
+			FROM unnest(ARRAY[$starts]) WITH ORDINALITY AS u(g, n)
+			ORDER BY n;
+		};
+
+		my $plan = $node->safe_psql('postgres', "$serial_prefix EXPLAIN (COSTS OFF) $q");
+		like($plan, qr/SubPlan/, "rescan $name: inner scan is a subplan");
+		like($plan, qr/Index (Only )?Scan/, "rescan $name: inner scan uses the index");
+		is( $node->safe_psql('postgres', "$serial_prefix $q"),
+			$node->safe_psql('postgres', "$heap_prefix $q"),
+			"rescan $name: every rescan matches heap");
+	}
+	amcheck_ok('rescan');
+}
 
 # ==============================================================================
 # SECTION 3/4: concurrent serial and parallel scans
@@ -1065,10 +1136,12 @@ cmp_ok($node->safe_psql('postgres', "SELECT bt_merge('merge_par_idx', 10, 90, 10
 	my $q = 'SELECT id FROM merge_par WHERE id <= 5124 ORDER BY id DESC';
 	like($node->safe_psql('postgres', "$parallel_prefix EXPLAIN (COSTS OFF) $q"),
 		qr/Parallel Index (Only )?Scan Backward/, 'parallel backward: plan is a parallel backward scan');
+	my $launched = workers_launched();
 	is_deeply(
 		ids_of($node, "$parallel_prefix SET statement_timeout = '60s'; $q"),
 		ids_of($node, "$heap_prefix $q"),
 		'parallel backward scan from the merged page matches heap');
+	workers_ran($launched, 'parallel backward scan from the merged page');
 }
 
 $node->safe_psql('postgres', q{
