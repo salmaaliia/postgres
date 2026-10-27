@@ -109,6 +109,34 @@ static void _bt_binsrch_skiparray_skey(bool cur_elem_trig, ScanDirection dir,
 static bool _bt_verify_keys_with_arraykeys(IndexScanDesc scan);
 #endif
 
+/*
+ * _bt_posting_upper_bound - Find first posting list entry whose TID > boundary.
+ */
+static int
+_bt_posting_upper_bound(IndexTuple itup, ItemPointer boundary)
+{
+	int			low = 0;
+	int			high = BTreeTupleGetNPosting(itup),
+				res;
+
+	Assert(BTreeTupleIsPosting(itup));
+	Assert(high >= 2);
+
+	while (low < high)
+	{
+		int			mid = low + (high - low) / 2;
+
+		res = ItemPointerCompare(BTreeTupleGetPostingN(itup, mid), boundary);
+
+		if (res <= 0)
+			low = mid + 1;
+		else
+			high = mid;
+	}
+
+	return low;
+}
+
 
 /*
  *	_bt_readpage() -- Load data from current index page into so->currPos
@@ -145,6 +173,8 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 				ignore_killed_tuples = scan->ignore_killed_tuples;
 	int			itemIndex,
 				indnatts;
+	bool		mergeFiltered;
+	int			startIndex = -1;	/* first item to return, if mergeFiltered */
 
 	/* save the page/buffer block number, along with its sibling links */
 	page = BufferGetPage(so->currPos.buf);
@@ -155,6 +185,9 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 	/* delay setting so->currPos.lsn until _bt_drop_lock_and_maybe_pin */
 	pstate.dir = so->currPos.dir = dir;
 	so->currPos.nextTupleOffset = 0;
+
+	mergeFiltered = P_ISMERGED(opaque) && so->currPos.needMergeRecovery;
+	so->currPos.mergeFiltered = mergeFiltered;
 
 	/* either moreRight or moreLeft should be set now (may be unset later) */
 	Assert(ScanDirectionIsForward(dir) ? so->currPos.moreRight :
@@ -190,7 +223,7 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 		if (ScanDirectionIsForward(dir))
 			_bt_parallel_release(scan, so->currPos.nextPage,
 								 so->currPos.currPage);
-		else
+		else if (!so->currPos.needMergeRecovery)
 			_bt_parallel_release(scan, so->currPos.prevPage,
 								 so->currPos.currPage);
 	}
@@ -276,6 +309,56 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 
 			if (passes_quals)
 			{
+				if (P_ISMERGED(opaque) && so->currPos.needMergeRecovery)
+				{
+					int			cmp;
+
+					Assert(so->mergeBoundaryKey != NULL);
+					cmp = _bt_compare(rel, so->mergeBoundaryKey, page, offnum);
+
+					/*
+					 * cmp > 0 is a tuple from L: save it for a direction
+					 * turn, but don't start there
+					 */
+
+					if (cmp == 0)
+					{
+						if (!BTreeTupleIsPosting(itup))
+						{
+							/* Crossed the boundary! Shut off recovery */
+							so->currPos.needMergeRecovery = false;
+							_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
+
+							startIndex = itemIndex + 1;
+						}
+						else
+						{
+							int			posStart = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
+
+							if (posStart < BTreeTupleGetNPosting(itup))
+							{
+								/* Crossed the boundary! Shut off recovery */
+								so->currPos.needMergeRecovery = false;
+								_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
+								startIndex = itemIndex + posStart;
+							}
+
+						}
+					}
+					else if (cmp < 0)
+					{
+
+						/*
+						 * Boundary < Tuple: this tuple is strictly after the
+						 * boundary. Belongs to R; forward scan has not seen
+						 * it yet. Keep whole tuple and shut off recovery
+						 */
+						so->currPos.needMergeRecovery = false;
+						_bt_parallel_set_skip_ma(scan, BTMergedPageGetMABlkno(page));
+						startIndex = itemIndex;
+					}
+				}
+
 				/* tuple passes all scan key conditions */
 				if (!BTreeTupleIsPosting(itup))
 				{
@@ -345,6 +428,13 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 		so->currPos.firstItem = 0;
 		so->currPos.lastItem = itemIndex - 1;
 		so->currPos.itemIndex = 0;
+
+		if (mergeFiltered)
+		{
+			if (startIndex < 0 || startIndex > so->currPos.lastItem)
+				return false;
+			so->currPos.itemIndex = startIndex;
+		}
 	}
 	else
 	{
@@ -461,6 +551,36 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 
 			if (passes_quals && tuple_alive)
 			{
+				int			cmp;
+
+				if (P_ISMERGED(opaque) && so->currPos.needMergeRecovery && startIndex < 0)
+				{
+					Assert(so->mergeBoundaryKey != NULL);
+
+					cmp = _bt_compare(rel, so->mergeBoundaryKey, page, offnum);
+
+					if (cmp < 0)
+					{
+						/*
+						 * Tuple from R: save it for a direction turn, but
+						 * don't start there
+						 */
+					}
+					else if (cmp == 0 && BTreeTupleIsPosting(itup))
+					{
+						/* TIDs before nfromL came from L */
+						int			nfromL = _bt_posting_upper_bound(itup, so->mergeBoundaryKey->scantid);
+
+						if (nfromL > 0)
+							startIndex = itemIndex - (BTreeTupleGetNPosting(itup) - nfromL + 1);
+					}
+					else
+					{
+						/* Last tuple from L */
+						startIndex = itemIndex - 1;
+					}
+				}
+
 				/* tuple passes all scan key conditions */
 				if (!BTreeTupleIsPosting(itup))
 				{
@@ -508,6 +628,13 @@ _bt_readpage(IndexScanDesc scan, ScanDirection dir, OffsetNumber offnum,
 		so->currPos.firstItem = itemIndex;
 		so->currPos.lastItem = MaxTIDsPerBTreePage - 1;
 		so->currPos.itemIndex = MaxTIDsPerBTreePage - 1;
+
+		if (mergeFiltered)
+		{
+			if (startIndex < 0)
+				return false;
+			so->currPos.itemIndex = startIndex;
+		}
 	}
 
 	/*

@@ -1773,7 +1773,7 @@ _bt_rightsib_halfdeadflag(Relation rel, BlockNumber leafrightsib)
 	opaque = BTPageGetOpaque(page);
 
 	Assert(P_ISLEAF(opaque) && !P_ISDELETED(opaque));
-	result = P_ISHALFDEAD(opaque);
+	result = P_ISHALFDEAD(opaque) || P_ISMERGEDAWAY(opaque);
 	_bt_relbuf(rel, buf);
 
 	return result;
@@ -2114,6 +2114,7 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	IndexTuple	itup;
 	IndexTupleData trunctuple;
 	XLogRecPtr	recptr;
+	BlockNumber mablkno;
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
@@ -2244,6 +2245,7 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
 	opaque->btpo_flags |= BTP_HALF_DEAD;
+	mablkno = P_ISMERGED(opaque) ? BTMergedPageGetMABlkno(page) : InvalidBlockNumber;
 
 	Assert(PageGetMaxOffsetNumber(page) == P_HIKEY);
 	MemSet(&trunctuple, 0, sizeof(IndexTupleData));
@@ -2271,6 +2273,8 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 			xlrec.topparent = topparent;
 		else
 			xlrec.topparent = InvalidBlockNumber;
+
+		xlrec.merged_ma_blkno = mablkno;
 
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, leafbuf, REGBUF_WILL_INIT);
@@ -2350,9 +2354,12 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	IndexTuple	leafhikey;
 	BlockNumber leaftopparent;
 	XLogRecPtr	recptr;
+	BlockNumber mablkno;
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
+
+	mablkno = P_ISMERGED(opaque) ? BTMergedPageGetMABlkno(page) : InvalidBlockNumber;
 
 	Assert(P_ISLEAF(opaque) && !P_ISDELETED(opaque) && P_ISHALFDEAD(opaque));
 
@@ -2576,7 +2583,7 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	}
 
 	rightsib_is_rightmost = P_RIGHTMOST(opaque);
-	*rightsib_empty = (P_FIRSTDATAKEY(opaque) > PageGetMaxOffsetNumber(page));
+	*rightsib_empty = !P_ISMERGEDAWAY(opaque) && (P_FIRSTDATAKEY(opaque) > PageGetMaxOffsetNumber(page));
 
 	/*
 	 * If we are deleting the next-to-last page on the target's level, then
@@ -2717,6 +2724,8 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 		xlrec.leafleftsib = leafleftsib;
 		xlrec.leafrightsib = leafrightsib;
 		xlrec.leaftopparent = leaftopparent;
+
+		xlrec.merged_ma_blkno = mablkno;
 
 		XLogRegisterData(&xlrec, SizeOfBtreeUnlinkPage);
 
@@ -3135,4 +3144,96 @@ _bt_pendingfsm_add(BTVacState *vstate,
 	vstate->pendingpages[vstate->npendingpages].target = target;
 	vstate->pendingpages[vstate->npendingpages].safexid = safexid;
 	vstate->npendingpages++;
+}
+
+/*
+ * Return true if leaf pages left_blkno and right_blkno have the same parent,
+ * with the left page's downlink right before the right page's.  scankey must
+ * find the left page.  If stack_out is not NULL, the descent stack is
+ * returned in it, for the caller to free.
+ */
+bool
+_bt_pages_share_parent(Relation rel, BlockNumber left_blkno,
+					   BlockNumber right_blkno, BTScanInsert scankey, BTStack *stack_out)
+{
+	BTStack		stack;
+	Buffer		found_buf = InvalidBuffer;
+	BlockNumber parent_blkno = InvalidBlockNumber;
+	Buffer		parentbuf;
+	Page		parentpage;
+	OffsetNumber maxoff,
+				left_off;
+	bool		found_left = false;
+	IndexTuple	itup;
+	BlockNumber child;
+
+
+	/* Descend the tree to find left's parent. Caller built scankey. */
+	stack = _bt_search(rel, NULL, scankey, &found_buf, BT_READ, true);
+
+	if (BufferIsValid(found_buf))
+		UnlockReleaseBuffer(found_buf);
+
+	if (stack == NULL)
+		return false;
+
+	parent_blkno = stack->bts_blkno;
+
+	if (parent_blkno == InvalidBlockNumber)
+	{
+		_bt_freestack(stack);
+		return false;
+	}
+
+	parentbuf = ReadBuffer(rel, parent_blkno);
+	LockBuffer(parentbuf, BUFFER_LOCK_SHARE);
+	parentpage = BufferGetPage(parentbuf);
+
+	left_off = stack->bts_offset;
+
+	maxoff = PageGetMaxOffsetNumber(parentpage);
+
+	/* The parent may have changed since the descent */
+	if (left_off < P_FIRSTDATAKEY(BTPageGetOpaque(parentpage)) || left_off > maxoff)
+	{
+		UnlockReleaseBuffer(parentbuf);
+		_bt_freestack(stack);
+		return false;
+	}
+
+	itup = (IndexTuple) PageGetItem(parentpage, PageGetItemId(parentpage, left_off));
+
+	child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+	if (child == left_blkno)
+	{
+		found_left = true;
+	}
+	/* Check that the next downlink in the parent points to the right sibling */
+	if (found_left)
+	{
+		OffsetNumber next_off = OffsetNumberNext(left_off);
+
+		if (next_off <= maxoff)
+		{
+			itup = (IndexTuple) PageGetItem(parentpage, PageGetItemId(parentpage, next_off));
+
+			child = ItemPointerGetBlockNumberNoCheck(&itup->t_tid);
+
+			if (child == right_blkno)
+			{
+				UnlockReleaseBuffer(parentbuf);
+				if (stack_out != NULL)
+					*stack_out = stack;
+				else
+					_bt_freestack(stack);
+				return true;
+			}
+		}
+	}
+
+	UnlockReleaseBuffer(parentbuf);
+	_bt_freestack(stack);
+	return false;
+
 }

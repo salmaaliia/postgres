@@ -216,6 +216,8 @@ BTIndexStat
 BTInsertState
 BTInsertStateData
 BTLeader
+BTMergeState
+BTMergedAwayPageData
 BTMetaPageData
 BTOneVacInfo
 BTOptions
@@ -4377,6 +4379,8 @@ type
 tzEntry
 u_char
 u_int
+ua_merge_candidates
+ua_merge_detail
 ua_page_items
 ua_page_stats
 uchr
@@ -4455,10 +4459,13 @@ xl_brin_insert
 xl_brin_revmap_extend
 xl_brin_samepage_update
 xl_brin_update
+xl_btree_clear_m
 xl_btree_dedup
 xl_btree_delete
 xl_btree_insert
+xl_btree_mark_ma_hd
 xl_btree_mark_page_halfdead
+xl_btree_merge
 xl_btree_metadata
 xl_btree_newroot
 xl_btree_reuse_page

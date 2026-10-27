@@ -440,6 +440,274 @@ whenever it is subsequently taken from the FSM for reuse.  The deleted
 page's contents will be overwritten by the split operation (it will become
 the new right sibling page).
 
+Merging leaf pages
+------------------
+
+Page deletion only removes leaf pages that are completely empty.  After
+many deletions an index can also have many leaf pages that are nearly
+empty, which page deletion cannot help with.  Merging moves all the tuples
+of such a page into its right sibling.  The left page is then empty, and
+VACUUM removes it later.  The code is in nbtmerge.c.
+
+In this section L is the left page and R its right sibling.  After the
+merge, R holds the tuples of both pages and is marked BTP_MERGED; we call it
+a merged page.  L is marked BTP_MERGED_AWAY; we call it a tombstone.  R
+stores L's block number in pd_prune_xid, which nbtree does not otherwise use
+on leaf pages.  The tombstone stores the boundary key and safemergexid.
+The boundary key is L's last key together with its largest heap TID, so it
+tells L's tuples apart from R's even when both pages hold the same key.
+safemergexid is the next transaction ID at the time of the merge; it plays
+the same role as safexid does for deleted pages.
+
+The tuples move right, not left, for the same reason a page split moves
+tuples right.  A search that read the parent before the merge may still
+arrive at L.  It finds a tombstone and moves right to R, where L's keys now
+are.  This is the Lehman and Yao way to recover from a concurrent change,
+and it means searches and inserts never have to move left to find a key.
+Scans are different: some of them do read L after the merge, to get the
+boundary key.  This is explained in the sections about scans below.
+
+L and R must have the same parent.  This is the same rule as for page
+deletion (see above): the key space of a page can only move into its right
+sibling when both have the same parent, or the separator keys in the
+grandparent would have to change too.  In the parent, L's downlink is made
+to point to R, and R's downlink is removed.  The key space of both pages now
+leads to R.  R's high key does not change.
+
+Both pages must be under a fill threshold, and the tuples of both must fit
+on R within a target fillfactor.  A page that is deleted, half-dead,
+merged, a tombstone, or not finished splitting is never merged.  A merged
+page is not merged again until VACUUM has cleaned up its merge group (see
+below).  The leftmost leaf page is never merged away: if it became a
+tombstone and then half-dead, a backward scan would reach a half-dead
+leftmost page, which it does not expect.
+
+Merges are found by walking the leaf level from left to right, holding
+share locks on two neighbors at a time.  When a pair qualifies, the locks
+are released and a new descent finds the parent and checks that L's
+downlink comes right before R's.  The merge itself then locks L, R and the
+parent, in that order: left to right, then up, as for a page split, so it
+cannot deadlock with splits or page deletion.  With all three pages locked,
+everything is checked again, since anything may have changed while no lock
+was held.
+
+The lock on L is a cleanup lock.  Index-only scans, and scans that use a
+non-MVCC snapshot, keep their pin on a leaf page while they return its
+tuples (see "Making concurrent TID recycling safe" below).  Moving the
+tuples off a page that such a scan has pinned would break that rule.  The
+cleanup lock is only tried, never waited for: if L is pinned, the merge
+skips the pair, and a later merge can try again.
+
+The merge changes the three pages in one critical section with one WAL
+record.  L's tuples and then R's are written to R; R keeps its high key and
+is marked merged.  The parent is changed as described above.  L is
+reinitialized as a tombstone.  No sibling link changes: L's left sibling
+still points to L, and L still points to R.  Predicate locks on L are moved
+to R.
+
+A merge group is a tombstone together with the merged pages that point to
+it.  At first that is just R, but R can split later, and both halves keep
+the merged flag and the tombstone's block number.  The merged pages of a
+group are always next to each other, right of the tombstone.  Splits,
+deduplication and page deletion all rebuild the page, so their WAL records
+carry the tombstone's block number, and redo puts it back.  VACUUM can
+delete merged pages that become empty, and can even delete all of them
+while the tombstone stays; scans handle that case too.
+
+Deduplication can later put TIDs from both sides of the boundary into one
+posting list, for example when L's last key equals R's first key, or when
+new tuples with that key are inserted.  This is why the boundary key has a
+heap TID: TIDs at or below the boundary TID came from L, and the others
+did not.
+
+Merging and forward scans
+-------------------------
+
+A merge can happen while a scan is between two pages.  The scan must not
+return a tuple twice, and must not miss one.
+
+A forward scan that reaches L after the merge finds a tombstone.  It
+remembers the tombstone's block number and moves right.  When it reaches a
+merged page that points to that tombstone, it knows it has not returned
+any of L's tuples, so it returns all tuples of the merged page.
+
+A forward scan that read L before the merge has already returned L's
+tuples.  When it steps to R, it finds a merged page that points to a
+tombstone it never passed.  The scan must skip L's tuples on R, so it needs
+the boundary key.  It releases its lock on R, keeping the pin, locks the
+tombstone by its block number, copies the boundary key, releases the
+tombstone and locks R again.  The lock on R is released first because pages
+are always locked left to right.  This scan read L before the merge, so its
+snapshot is older than safemergexid, and VACUUM cannot clean up the group
+while it runs.  The tombstone is still a tombstone when the scan locks it.
+R may change while it is unlocked, so the scan reads R's page again after
+locking it.
+
+On the merged page, _bt_readpage saves all matching tuples in so->currPos,
+as for any page, but sets so->currPos.itemIndex to the first tuple after
+the boundary key.  For a posting list with the boundary key, that is the
+first TID above the boundary TID.  The tuples before it stay in
+so->currPos (see "Merging and scans that change direction" below).  If no
+tuple on the page is after the boundary, there is no place to start, so
+_bt_readpage reports that the page has no matches, and the scan moves to
+the next page with the filter still on.  Once a starting tuple is found,
+the filter is turned off, and the rest of the group is read as usual.
+
+A scan that descends straight to a merged page has not seen L at all.  It
+treats the group as already passed, the same as if it had stepped over the
+tombstone, and never loads the boundary key.  A new descent also clears
+any merge state the scan had before, since a scan can end inside a group
+and then start again somewhere else.
+
+Merging and backward scans
+--------------------------
+
+A backward scan that reaches a merge group from the right after the merge
+reads every merged page of the group as usual, then steps left onto the
+tombstone.  It has already returned L's tuples from the merged pages, so it
+skips the tombstone and moves on to the tombstone's left sibling.
+
+A backward scan that read R before the merge has already returned R's
+tuples.  When it steps left to L, it finds a tombstone, and L's tuples are
+now in the merged pages to its right.  This is the case that needs the
+most work.  The scan copies the boundary key from the tombstone.  Since R
+may have split since the merge, L's tuples may be on any merged page of the
+group, so the scan walks right from the tombstone to the last merged page
+of the group, coupling locks as it goes.  It then reads the group from
+right to left as a backward scan normally does, using the page right of
+the group as the "original page" of the move-left algorithm.  On each
+merged page, _bt_readpage again saves all matching tuples, and sets
+so->currPos.itemIndex to the last tuple at or below the boundary key; for
+a posting list with the boundary key, the last TID at or below the
+boundary TID.  If the page has no such tuple, there is no place to start,
+and the scan moves left to the next page.  The filter stays on until the
+scan reaches the tombstone again.  It then skips the tombstone and moves on
+to the tombstone's left sibling.
+
+If VACUUM has deleted every merged page of the group, the tombstone's right
+sibling is no longer a merged page of the group.  Then there is nothing to
+recover, and the scan just steps past the tombstone.
+
+Merging and scans that change direction
+---------------------------------------
+
+A cursor can change direction in the middle of a page.  For a normal page
+this just works: _bt_readpage saved all matching tuples of the page in
+so->currPos, and the scan returns them in the new direction, then reads the
+page on the other side.
+
+A merged page read with the boundary filter works the same way, because
+the filter does not throw away the tuples on the other side of the
+boundary: they are saved in so->currPos, and only the starting item is
+moved to the boundary (see above).  If the cursor turns,
+the scan returns the saved tuples in the new direction.  For a forward scan
+those are L's tuples, which is correct: they come right before the tuples
+it just returned.  If they had not been saved, the scan would have to go
+back to L to find them, and L is now an empty tombstone.  The same holds for
+a backward scan and R's tuples.
+
+The merge state of the scan is kept in BTScanPosData, with the rest of the
+page's state, so that it always matches the page in so->currPos.  When the
+scan leaves a group, it clears the state but keeps the boundary key, which
+lives in BTScanOpaqueData, because a turn or a restore can bring the scan
+back into the group.
+
+Merging, parallel scans, and mark and restore
+---------------------------------------------
+
+In a parallel scan, one process may read L before the merge while another
+reaches R after it, so a process cannot tell from its own state whether
+L's tuples were already returned.  The shared scan state therefore holds
+one more block number: a tombstone whose L tuples are already taken care
+of.  A process sets it when it steps over a tombstone in a forward scan,
+when it reads past the boundary, when it reads a merged page in a backward
+scan, and when it descends straight into a merge group.  A process that
+reaches a merged page in a forward scan, or a tombstone in a backward scan,
+checks this field instead of its own state.
+
+A forward scan needs nothing more.  Its processes take the pages of a
+group from the shared scan one at a time, as usual, and each one can apply
+the boundary filter to its own page, since the filter only depends on the
+boundary key.  The forward scan that steps over a tombstone sets the field
+before it hands out the next page, so a process that gets a merged page of
+that group always sees it.  Each page is handed out only once, so L is read
+either before the merge or as a tombstone, never both.
+
+A backward scan that must recover L's tuples is different, since it has to
+go back to pages right of the tombstone, which the shared scan has already
+handed out.  So it reads the pages of the group itself, without taking
+them from the shared scan.  It seized the shared scan to read the
+tombstone, and keeps it seized while it reads the group; it releases it
+only when it comes back to the tombstone, with the tombstone's left sibling
+as the next page.  The other processes wait until then.
+
+Mark and restore copies so->currPos to so->markPos and back, and the merge
+state is part of it.  The boundary key is not, so when a mark is taken
+while the boundary filter is on, a copy of the boundary key is saved with
+the mark.  The scan may load the boundary key of another group after the
+mark.  On restore, if the loaded key is missing or comes from another
+tombstone, it is rebuilt from the saved copy.  A merge join that restores
+its mark across two merge groups depends on this.
+
+Cleaning up merge groups
+------------------------
+
+A scan that started before a merge may still need the tombstone and its
+boundary key.  So VACUUM only cleans up a merge group once safemergexid is
+older than every running transaction.  This is the same drain technique
+used before a deleted page is recycled (see "Placing deleted pages in the
+FSM" above).
+
+VACUUM cleans up a group when its linear scan reaches the tombstone.  It
+releases its lock on the tombstone, keeping the pin, and walks right with
+lock coupling to find the last merged page of the group.  Then it walks
+back from there to the tombstone, right to left, and clears the merged flag
+on each page, with one WAL record per page.  A page that points to a
+different tombstone should never be found here; if it is, VACUUM stops and
+leaves the group for a later VACUUM.  Last, VACUUM locks the tombstone
+again, checks that it has not changed, and turns it into a half-dead page
+with a dummy high key.  The tombstone has no downlink in the parent
+anymore, so this is exactly the state after the first stage of page
+deletion.  Normal page deletion then unlinks the page from its siblings and
+marks it deleted, and it is recycled like any other deleted page.
+
+The order matters when VACUUM stops part way, for example after a crash
+between two of these records.  The next VACUUM walks right from the
+tombstone and stops at the first page that is not in the group; if that is
+the tombstone's right sibling, it takes the group for empty and goes
+straight to the last step.  Clearing from the right keeps the pages that
+are still merged together, right after the tombstone, where the next
+VACUUM finds them.  Had VACUUM cleared from the left, the page next to the
+tombstone would be cleared first, and the next VACUUM would finish the
+tombstone while merged pages further right still point to it.
+
+VACUUM only does this when it scans the index, which it does when there
+are dead tuples to remove.  Tombstones can therefore stay in the index for
+a while.
+
+A merge can also run while VACUUM scans the index, and move tuples from a
+page VACUUM has not reached into a page it already passed.  This is the
+same problem a page split causes, and it is solved the same way: the merge
+stamps both pages with the current VACUUM cycle ID, and when VACUUM finds a
+tombstone with its cycle ID whose right sibling it already passed, it goes
+back and reads that page again.
+
+Merging and WAL
+---------------
+
+The merge records use their own resource manager, Btree2, because the btree
+resource manager already uses 15 of the 16 record types it can have.
+There are three records: MERGE, CLEAR_MERGED_FLAG and MARK_MA_AS_HD.
+
+MERGE registers the tombstone, with the boundary key as its data, the
+merged page as a full page image, and the parent.  Its redo takes a cleanup
+lock on L, like the merge itself: on a hot standby, an index-only scan may
+have L pinned too.
+
+CLEAR_MERGED_FLAG and MARK_MA_AS_HD carry safemergexid.  Replaying them
+cancels standby queries whose snapshot is older than safemergexid, since
+such a query could still need the tombstone, as on the primary.
+
 Making concurrent TID recycling safe
 ------------------------------------
 

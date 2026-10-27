@@ -21,6 +21,8 @@
 #include "access/nbtree.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
+#include "access/nbtxlog.h"
+#include "access/xloginsert.h"
 #include "commands/progress.h"
 #include "commands/vacuum.h"
 #include "nodes/execnodes.h"
@@ -37,6 +39,7 @@
 #include "utils/index_selfuncs.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
+
 
 
 /*
@@ -71,6 +74,7 @@ typedef struct BTParallelScanDescData
 	BlockNumber btps_nextScanPage;	/* next page to be scanned */
 	BlockNumber btps_lastCurrPage;	/* page whose sibling link was copied into
 									 * btps_nextScanPage */
+	BlockNumber btps_skipMABlkno;	/* MA tombstone blkno skipped by a worker */
 	BTPS_State	btps_pageStatus;	/* indicates whether next page is
 									 * available for scan. see above for
 									 * possible states of parallel scan. */
@@ -348,7 +352,7 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	scan = RelationGetIndexScan(rel, nkeys, norderbys);
 
 	/* allocate private workspace */
-	so = palloc_object(BTScanOpaqueData);
+	so = palloc0_object(BTScanOpaqueData);
 	BTScanPosInvalidate(so->currPos);
 	BTScanPosInvalidate(so->markPos);
 	if (scan->numberOfKeys > 0)
@@ -373,6 +377,15 @@ btbeginscan(Relation rel, int nkeys, int norderbys)
 	 * scan->xs_itupdesc whether we'll need it or not, since that's so cheap.
 	 */
 	so->currTuples = so->markTuples = NULL;
+
+	/* Initialize merge fields */
+	so->currPos.skipMergeRecovery = false;
+	so->currPos.needMergeRecovery = false;
+	so->currPos.mergedAwayBlkno = InvalidBlockNumber;
+	so->mergeBoundaryKey = NULL;
+	so->mergeBoundaryItup = NULL;
+	so->mergeBoundaryBlkno = InvalidBlockNumber;
+	so->markBoundaryItup = NULL;
 
 	scan->xs_itupdesc = RelationGetDescr(rel);
 
@@ -427,6 +440,27 @@ btrescan(IndexScanDesc scan, ScanKey scankey, int nscankeys,
 	BTScanPosUnpinIfPinned(so->markPos);
 	BTScanPosInvalidate(so->markPos);
 
+	so->currPos.skipMergeRecovery = false;
+	so->currPos.needMergeRecovery = false;
+	so->currPos.mergedAwayBlkno = InvalidBlockNumber;
+
+	if (so->mergeBoundaryKey)
+	{
+		pfree(so->mergeBoundaryKey);
+		so->mergeBoundaryKey = NULL;
+	}
+	if (so->mergeBoundaryItup)
+	{
+		pfree(so->mergeBoundaryItup);
+		so->mergeBoundaryItup = NULL;
+	}
+	so->mergeBoundaryBlkno = InvalidBlockNumber;
+	if (so->markBoundaryItup)
+	{
+		pfree(so->markBoundaryItup);
+		so->markBoundaryItup = NULL;
+	}
+
 	/*
 	 * Allocate tuple workspace arrays, if needed for an index-only scan and
 	 * not already done in a previous rescan call.  To save on palloc
@@ -469,6 +503,22 @@ btendscan(IndexScanDesc scan)
 	BTScanPosUnpinIfPinned(so->markPos);
 
 	/* No need to invalidate positions, the RAM is about to be freed. */
+
+	if (so->mergeBoundaryKey)
+	{
+		pfree(so->mergeBoundaryKey);
+		so->mergeBoundaryKey = NULL;
+	}
+	if (so->mergeBoundaryItup)
+	{
+		pfree(so->mergeBoundaryItup);
+		so->mergeBoundaryItup = NULL;
+	}
+	if (so->markBoundaryItup)
+	{
+		pfree(so->markBoundaryItup);
+		so->markBoundaryItup = NULL;
+	}
 
 	/* Release storage */
 	if (so->keyData != NULL)
@@ -556,6 +606,28 @@ btrestrpos(IndexScanDesc scan)
 			if (so->currTuples)
 				memcpy(so->currTuples, so->markTuples,
 					   so->markPos.nextTupleOffset);
+
+			/*
+			 * The marked page needs the boundary of its merge group, but the
+			 * scan may have loaded another group's boundary since the mark.
+			 * Rebuild it from the copy saved with the mark.
+			 */
+			if (so->currPos.needMergeRecovery &&
+				(so->mergeBoundaryKey == NULL ||
+				 so->mergeBoundaryBlkno != so->currPos.mergedAwayBlkno))
+			{
+				Assert(so->markBoundaryItup != NULL);
+
+				if (so->mergeBoundaryKey)
+					pfree(so->mergeBoundaryKey);
+				if (so->mergeBoundaryItup)
+					pfree(so->mergeBoundaryItup);
+
+				so->mergeBoundaryItup = CopyIndexTuple(so->markBoundaryItup);
+				so->mergeBoundaryKey = _bt_mkscankey(scan->indexRelation,
+													 so->mergeBoundaryItup);
+				so->mergeBoundaryBlkno = so->currPos.mergedAwayBlkno;
+			}
 			/* Reset the scan's array keys (see _bt_steppage for why) */
 			if (so->numArrayKeys)
 			{
@@ -820,6 +892,7 @@ btinitparallelscan(void *target)
 	bt_target->btps_nextScanPage = InvalidBlockNumber;
 	bt_target->btps_lastCurrPage = InvalidBlockNumber;
 	bt_target->btps_pageStatus = BTPARALLEL_NOT_INITIALIZED;
+	bt_target->btps_skipMABlkno = InvalidBlockNumber;
 	ConditionVariableInit(&bt_target->btps_cv);
 }
 
@@ -846,6 +919,7 @@ btparallelrescan(IndexScanDesc scan)
 	btscan->btps_nextScanPage = InvalidBlockNumber;
 	btscan->btps_lastCurrPage = InvalidBlockNumber;
 	btscan->btps_pageStatus = BTPARALLEL_NOT_INITIALIZED;
+	btscan->btps_skipMABlkno = InvalidBlockNumber;
 	LWLockRelease(&btscan->btps_lock);
 }
 
@@ -893,6 +967,9 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 	BTScanPosInvalidate(so->currPos);
 	so->currPos.moreLeft = so->currPos.moreRight = true;
 
+	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
+												  parallel_scan->ps_offset_am);
+
 	if (first)
 	{
 		/*
@@ -912,9 +989,6 @@ _bt_parallel_seize(IndexScanDesc scan, BlockNumber *next_scan_page,
 		if (so->needPrimScan)
 			return false;
 	}
-
-	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
-												  parallel_scan->ps_offset_am);
 
 	while (1)
 	{
@@ -1407,7 +1481,8 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
  * a previous call here.  This is how we handle page splits (that happened
  * after our cycleid was acquired) whose right half page happened to reuse
  * a block that we might have processed at some point before it was
- * recycled (i.e. before the page split).
+ * recycled (i.e. before the page split).  Merges that move tuples into an
+ * already scanned page are handled the same way.
  *
  * Returns BlockNumber of a scanned page (not backtracked).
  */
@@ -1518,6 +1593,272 @@ backtrack:
 		 * pages_deleted stats in all cases (barring corruption)
 		 */
 	}
+	else if (P_ISMERGEDAWAY(opaque))
+	{
+		FullTransactionId safemergexid = BTMergedAwayGetSafeXid(page);
+
+		/*
+		 * A merge during this VACUUM may have moved dead tuples from this
+		 * page (not yet visited) into R, a page we already passed.  If so,
+		 * backtrack to R, as for a split.  This must happen even if the
+		 * tombstone is too new to reclaim, and it ignores BTP_SPLIT_END
+		 * because a stale flag may be left from before the merge.
+		 */
+		if (vstate->cycleid != 0 &&
+			opaque->btpo_cycleid == vstate->cycleid &&
+			!P_RIGHTMOST(opaque) &&
+			opaque->btpo_next < scanblkno)
+			backtrack_to = opaque->btpo_next;
+
+		/*
+		 * Only reclaim the tombstone when it is the scan page.  While
+		 * backtracking we must not delete pages, as in the leaf case below.
+		 */
+		if (blkno == scanblkno &&
+			GlobalVisCheckRemovableFullXid(heaprel, safemergexid))
+		{
+			BlockNumber tail_blkno;
+			BlockNumber curr_blkno = opaque->btpo_next;
+			Buffer		curr_buf;
+			BTPageOpaque curr_opaque;
+			Buffer		next_buf;
+			BTPageOpaque next_opaque;
+			BlockNumber next_blkno;
+
+			BlockNumber bwd_blkno;
+			BlockNumber right_anchor;
+			Buffer		bwd_buf;
+			Page		bwd_page,
+						curr_page;
+			BTPageOpaque bwd_opaque;
+			BlockNumber nextblk;
+			BTPageOpaqueData saved_opaque;
+			IndexTupleData trunctuple;
+			XLogRecPtr	recptr;
+
+			/*
+			 * We release the MA page lock here because the forward and
+			 * backward walks acquire write locks on M pages.  Holding the MA
+			 * read lock across multiple buffer lock acquisitions would
+			 * violate PostgreSQL's lock ordering rules and risk deadlock. The
+			 * pin on buf is retained throughout, preventing the MA page from
+			 * being recycled.
+			 */
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+
+			/* Walk Forward to find the tail using lock coupling. */
+			curr_buf = _bt_getbuf(rel, curr_blkno, BT_READ);
+			curr_page = BufferGetPage(curr_buf);
+			curr_opaque = BTPageGetOpaque(curr_page);
+
+			/*
+			 * If the last VACUUM run cleared all M page flags but stopped
+			 * before clearing the MA page flag, skip straight to finalizing
+			 * the tombstone.
+			 */
+			if (!BTPageIsMergedMember(curr_opaque, curr_page, blkno))
+			{
+				_bt_relbuf(rel, curr_buf);
+				goto finalize_ma;
+			}
+
+			while (true)
+			{
+				next_blkno = curr_opaque->btpo_next;
+
+				if (next_blkno == P_NONE)
+				{
+					tail_blkno = curr_blkno;
+					right_anchor = P_NONE;
+					_bt_relbuf(rel, curr_buf);
+					break;
+				}
+
+				next_buf = _bt_getbuf(rel, next_blkno, BT_READ);
+				next_opaque = BTPageGetOpaque(BufferGetPage(next_buf));
+
+				/* End of the merge group reached; stop the forward walk. */
+				if (!BTPageIsMergedMember(next_opaque, BufferGetPage(next_buf), blkno))
+				{
+					tail_blkno = curr_blkno;
+					right_anchor = next_blkno;
+					_bt_relbuf(rel, curr_buf);
+					_bt_relbuf(rel, next_buf);
+					break;
+				}
+
+				_bt_relbuf(rel, curr_buf);
+				curr_blkno = next_blkno;
+				curr_buf = next_buf;
+				curr_opaque = next_opaque;
+			}
+
+			/*
+			 * Walk Backward to clear M flags (Stop before hitting the MA
+			 * tombstone!)
+			 */
+			bwd_blkno = tail_blkno;
+
+			while (bwd_blkno != blkno)
+			{
+				CHECK_FOR_INTERRUPTS();
+
+				bwd_buf = _bt_getbuf(rel, bwd_blkno, BT_WRITE);
+				bwd_page = BufferGetPage(bwd_buf);
+				bwd_opaque = BTPageGetOpaque(bwd_page);
+
+				while (bwd_opaque->btpo_next != right_anchor)
+				{
+					nextblk = bwd_opaque->btpo_next;
+					_bt_relbuf(rel, bwd_buf);
+
+					CHECK_FOR_INTERRUPTS();
+
+					bwd_buf = _bt_getbuf(rel, nextblk, BT_WRITE);
+					bwd_page = BufferGetPage(bwd_buf);
+					bwd_opaque = BTPageGetOpaque(bwd_page);
+
+					if (!BTPageIsMergedMember(bwd_opaque, bwd_page, blkno))
+					{
+						_bt_relbuf(rel, bwd_buf);
+						/* Lock MA page again before skiping cleanup */
+						LockBuffer(buf, BUFFER_LOCK_SHARE);
+						ereport(WARNING,
+								(errmsg("merged-away page %u: unexpected page state near block %u, deferring remaining cleanup to a future VACUUM",
+										blkno, bwd_blkno)));
+
+						goto skip_merge_cleanup;
+					}
+				}
+
+				/*
+				 * If we encounter a page from a different merge group,
+				 * something is wrong; skip the remaining cleanup and defer to
+				 * a future VACUUM.  This case is very unlikely because: -
+				 * When a page splits, the new page also inherits the M flag.
+				 * - No other VACUUM process runs concurrently on the same
+				 * index, so no other process can reset any page in between.
+				 */
+				if (!BTPageIsMergedMember(bwd_opaque, bwd_page, blkno))
+				{
+					_bt_relbuf(rel, bwd_buf);
+
+					/* Lock MA page again before skiping cleanup */
+					LockBuffer(buf, BUFFER_LOCK_SHARE);
+					ereport(WARNING,
+							(errmsg("merged-away page %u: unexpected page state near block %u, deferring remaining cleanup to a future VACUUM",
+									blkno, bwd_blkno)));
+
+					goto skip_merge_cleanup;
+				}
+
+				START_CRIT_SECTION();
+
+				bwd_opaque->btpo_flags &= ~(BTP_MERGED);
+				BTMergedPageClearMABlkno(bwd_page);
+				MarkBufferDirty(bwd_buf);
+
+				if (RelationNeedsWAL(rel))
+				{
+					xl_btree_clear_m xlrec = {0};
+
+					xlrec.safemergexid = safemergexid;
+					xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
+
+					XLogBeginInsert();
+
+					XLogRegisterData(&xlrec, SizeOfBtreeClearM);
+
+					XLogRegisterBuffer(0, bwd_buf, REGBUF_STANDARD);
+
+					recptr = XLogInsert(RM_BTREE2_ID, XLOG_BTREE2_CLEAR_MERGE_FLAG);
+				}
+				else
+					recptr = XLogGetFakeLSN(rel);
+
+				PageSetLSN(bwd_page, recptr);
+
+				END_CRIT_SECTION();
+
+				right_anchor = BufferGetBlockNumber(bwd_buf);
+				bwd_blkno = bwd_opaque->btpo_prev;
+				_bt_relbuf(rel, bwd_buf);
+			}
+
+	finalize_ma:
+
+			/* We are back at the tombstone(MA) to make it HD */
+
+			/* Upgrade our read lock to a write lock while keeping the pin! */
+			LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
+
+			if (!P_ISMERGEDAWAY(opaque) ||
+				!FullTransactionIdEquals(BTMergedAwayGetSafeXid(page), safemergexid))
+			{
+				/*
+				 * Downgrade from exclusive back to share lock before jumping
+				 * to skip_merge_cleanup.  The pin is still held, so the brief
+				 * unlock window is safe.  btvacuumpage and its caller expect
+				 * buf to exit with a lock held.
+				 */
+				LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+				LockBuffer(buf, BUFFER_LOCK_SHARE);
+				ereport(WARNING,
+						(errmsg("merged-away page %u changed concurrently, skipping cleanup",
+								blkno)));
+				goto skip_merge_cleanup;
+			}
+
+			/* _bt_pagedel() stage 2 requires a high key to exist on the page. */
+
+			saved_opaque = *opaque;
+
+			MemSet(&trunctuple, 0, sizeof(IndexTupleData));
+			trunctuple.t_info = sizeof(IndexTupleData);
+			BTreeTupleSetTopParent(&trunctuple, InvalidBlockNumber);
+
+			START_CRIT_SECTION();
+
+			PageInit(page, BufferGetPageSize(buf), sizeof(BTPageOpaqueData));
+
+			if (PageAddItem(page, (IndexTuple) &trunctuple, IndexTupleSize(&trunctuple),
+							P_HIKEY, false, false) == InvalidOffsetNumber)
+				elog(PANIC, "could not add dummy high key to half-dead page");
+
+			opaque = BTPageGetOpaque(page);
+			*opaque = saved_opaque;
+			opaque->btpo_flags &= ~(BTP_MERGED_AWAY | BTP_HAS_FULLXID);
+			opaque->btpo_flags |= BTP_HALF_DEAD;
+			MarkBufferDirty(buf);
+
+
+			if (RelationNeedsWAL(rel))
+			{
+				xl_btree_mark_ma_hd xlrec = {0};
+
+				xlrec.left_prev = opaque->btpo_prev;
+				xlrec.left_next = opaque->btpo_next;
+				xlrec.safemergexid = safemergexid;
+				xlrec.isCatalogRel = RelationIsAccessibleInLogicalDecoding(heaprel);
+
+				XLogBeginInsert();
+
+				XLogRegisterData(&xlrec, SizeOfBtreeMarkMaHd);
+
+				XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
+
+				recptr = XLogInsert(RM_BTREE2_ID, XLOG_BTREE2_MERGE_MARK_HALFDEAD);
+			}
+			else
+				recptr = XLogGetFakeLSN(rel);
+
+			PageSetLSN(page, recptr);
+
+			END_CRIT_SECTION();
+
+			attempt_pagedel = true;
+		}
+	}
 	else if (P_ISLEAF(opaque))
 	{
 		OffsetNumber deletable[MaxIndexTuplesPerPage];
@@ -1537,6 +1878,8 @@ backtrack:
 		 * deletable tuples --- see nbtree/README.
 		 */
 		_bt_upgradelockbufcleanup(rel, buf);
+
+		Assert(!P_ISMERGEDAWAY(opaque));
 
 		/*
 		 * Check whether we need to backtrack to earlier pages.  What we are
@@ -1695,6 +2038,8 @@ backtrack:
 		Assert(!attempt_pagedel || nhtidslive == 0);
 	}
 
+skip_merge_cleanup:
+
 	if (attempt_pagedel)
 	{
 		MemoryContext oldcontext;
@@ -1851,4 +2196,48 @@ bttranslatecmptype(CompareType cmptype, Oid opfamily)
 		default:
 			return InvalidStrategy;
 	}
+}
+
+/*
+ * Store in the shared parallel scan state the tombstone of the merge group a
+ * process has passed.  Other processes use it to tell whether L's tuples were
+ * already returned.  Does nothing for a serial scan.
+ */
+void
+_bt_parallel_set_skip_ma(IndexScanDesc scan, BlockNumber blkno)
+{
+	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
+	BTParallelScanDesc btscan;
+
+	if (scan->parallel_scan == NULL)
+		return;
+
+	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
+												  parallel_scan->ps_offset_am);
+
+	LWLockAcquire(&btscan->btps_lock, LW_EXCLUSIVE);
+	btscan->btps_skipMABlkno = blkno;
+	LWLockRelease(&btscan->btps_lock);
+}
+
+/*
+ * Return the tombstone stored by _bt_parallel_set_skip_ma(), or
+ * InvalidBlockNumber for a serial scan.
+ */
+BlockNumber
+_bt_parallel_get_skip_ma(IndexScanDesc scan)
+{
+	ParallelIndexScanDesc parallel_scan = scan->parallel_scan;
+	BTParallelScanDesc btscan;
+	BlockNumber blkno;
+
+	if (!scan->parallel_scan)
+		return InvalidBlockNumber;
+
+	btscan = (BTParallelScanDesc) OffsetToPointer(parallel_scan,
+												  parallel_scan->ps_offset_am);
+	LWLockAcquire(&btscan->btps_lock, LW_SHARED);
+	blkno = btscan->btps_skipMABlkno;
+	LWLockRelease(&btscan->btps_lock);
+	return blkno;
 }

@@ -254,6 +254,14 @@ _bt_killitems(IndexScanDesc scan)
 
 	page = BufferGetPage(buf);
 	opaque = BTPageGetOpaque(page);
+
+	/*
+	 * bt_merge() can convert a page to BTP_MERGED_AWAY while we hold a pin
+	 * but no lock.  The original tuples are gone; give up on hinting.
+	 */
+	if (P_ISMERGEDAWAY(opaque))
+		goto unlock_page;
+
 	minoff = P_FIRSTDATAKEY(opaque);
 	maxoff = PageGetMaxOffsetNumber(page);
 
@@ -967,7 +975,7 @@ _bt_check_natts(Relation rel, bool heapkeyspace, Page page, OffsetNumber offnum)
 	 * We cannot reliably test a deleted or half-dead page, since they have
 	 * dummy high keys
 	 */
-	if (P_IGNORE(opaque))
+	if (P_IGNORE(opaque) || P_ISMERGEDAWAY(opaque))
 		return true;
 
 	Assert(offnum >= FirstOffsetNumber &&
