@@ -84,7 +84,6 @@
 #include "rewrite/rewriteRemove.h"
 #include "storage/lmgr.h"
 #include "utils/fmgroids.h"
-#include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/syscache.h"
 
@@ -1391,28 +1390,12 @@ doDeletion(const ObjectAddress *object, int flags)
 											object->objectSubId);
 					else
 					{
-						/* Log the drop if requested */
-						if (log_object_drops &&
-							!(flags & PERFORM_DELETION_INTERNAL) &&
-							(relKind == RELKIND_RELATION ||
-							 relKind == RELKIND_PARTITIONED_TABLE) &&
-							get_rel_persistence(object->objectId) == RELPERSISTENCE_PERMANENT)
-						{
-							char	   *relname = get_rel_name(object->objectId);
-
-							if (relname != NULL)
-							{
-								char	   *schemaname = get_namespace_name(get_rel_namespace(object->objectId));
-
-								RegisterDropOrTruncateTable(object->objectId, relname,
-															schemaname ? schemaname : "unknown",
-															false);
-
-								pfree(relname);
-								if (schemaname)
-									pfree(schemaname);
-							}
-						}
+						/*
+						 * RegisterDropOrTruncateTable() decides whether this
+						 * table is logged
+						 */
+						if (!(flags & PERFORM_DELETION_INTERNAL))
+							RegisterDropOrTruncateTable(object->objectId, false);
 
 						heap_drop_with_catalog(object->objectId);
 					}

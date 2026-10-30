@@ -2527,6 +2527,7 @@ CommitTransaction(void)
 	AtEOXact_SPI(true);
 	AtEOXact_Enum();
 	AtEOXact_on_commit_actions(true);
+	AtEOXact_DropOrTruncateTable(true);
 	AtEOXact_Namespace(true, is_parallel_worker);
 	AtEOXact_SMgr();
 	AtEOXact_Files(true);
@@ -2823,6 +2824,7 @@ PrepareTransaction(void)
 	AtEOXact_SPI(true);
 	AtEOXact_Enum();
 	AtEOXact_on_commit_actions(true);
+	AtEOXact_DropOrTruncateTable(false);
 	AtEOXact_Namespace(true, false);
 	AtEOXact_SMgr();
 	AtEOXact_Files(true);
@@ -3054,6 +3056,7 @@ AbortTransaction(void)
 		AtEOXact_SPI(false);
 		AtEOXact_Enum();
 		AtEOXact_on_commit_actions(false);
+		AtEOXact_DropOrTruncateTable(false);
 		AtEOXact_Namespace(false, is_parallel_worker);
 		AtEOXact_SMgr();
 		AtEOXact_Files(false);
@@ -5269,6 +5272,8 @@ CommitSubTransaction(void)
 	AtEOSubXact_SPI(true, s->subTransactionId);
 	AtEOSubXact_on_commit_actions(true, s->subTransactionId,
 								  s->parent->subTransactionId);
+	AtEOSubXact_DropOrTruncateTable(true, s->subTransactionId,
+									s->parent->subTransactionId);
 	AtEOSubXact_Namespace(true, s->subTransactionId,
 						  s->parent->subTransactionId);
 	AtEOSubXact_Files(true, s->subTransactionId,
@@ -5443,6 +5448,8 @@ AbortSubTransaction(void)
 		AtEOSubXact_SPI(false, s->subTransactionId);
 		AtEOSubXact_on_commit_actions(false, s->subTransactionId,
 									  s->parent->subTransactionId);
+		AtEOSubXact_DropOrTruncateTable(false, s->subTransactionId,
+										s->parent->subTransactionId);
 		AtEOSubXact_Namespace(false, s->subTransactionId,
 							  s->parent->subTransactionId);
 		AtEOSubXact_Files(false, s->subTransactionId,

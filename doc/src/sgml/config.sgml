@@ -8538,10 +8538,8 @@ log_line_prefix = '%m [%p] %q%u@%d/%a '
 
       <para>
         Table operations that are rolled back (via <command>ROLLBACK</command> or
-        <command>ROLLBACK TO SAVEPOINT</command>) are not logged. Prepared
-        transactions (<command>PREPARE TRANSACTION</command>) log a notification
-        at prepare time, but do not record a recovery target LSN because the
-        eventual commit occurs in a separate two-phase commit transaction.
+        <command>ROLLBACK TO SAVEPOINT</command>) are not logged. Operations in prepared
+        transactions (<command>PREPARE TRANSACTION</command>) are not logged.
       </para>
 
       <para>

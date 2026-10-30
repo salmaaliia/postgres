@@ -347,7 +347,7 @@ $log = log_for(
 is(count_matches($log, $any_logged_re),
 	0, 'nothing is logged with log_object_drops = off');
 
-# Prepared transactions log a message at PREPARE time but no recovery LSN.
+# Nothing is logged for prepared transactions.
 
 $node->safe_psql(
 	'postgres', q{
@@ -362,20 +362,42 @@ $log = log_for(
 	PREPARE TRANSACTION 'p1';
 	COMMIT PREPARED 'p1';
 });
-is( count_matches(
-		$log,
-		qr/table "public\.t_2pc_drop" \(OID \d+\) is being dropped inside a prepared transaction/
-	),
-	1,
-	'DROP TABLE in a prepared transaction is reported');
-is( count_matches(
-		$log,
-		qr/table "public\.t_2pc_trunc" \(OID \d+\) is being truncated inside a prepared transaction/
-	),
-	1,
-	'TRUNCATE in a prepared transaction is reported');
 is(count_matches($log, $any_logged_re),
 	0, 'no recovery LSN is logged for a prepared transaction');
 $node->safe_psql('postgres', 'DROP TABLE t_2pc_trunc');
+
+# The hint is still logged once when the last registered drop is rolled back.
+$node->safe_psql('postgres', 'CREATE TABLE hint_a (id int); CREATE TABLE hint_b (id int);');
+$log = log_for(
+        q{
+        BEGIN;
+        DROP TABLE hint_a;
+        SAVEPOINT s;
+        DROP TABLE hint_b;
+        ROLLBACK TO SAVEPOINT s;
+        COMMIT;
+});
+is(count_matches($log, dropped_re('public.hint_a')),
+        1, 'drop before the rolled back savepoint is logged');
+is(count_matches($log, $hint_re),
+        1, 'hint is logged once when the last drop was rolled back');
+$node->safe_psql('postgres', 'DROP TABLE hint_b');
+
+# A rolled back drop does not leak into the next transaction.
+
+$node->safe_psql('postgres', 'CREATE TABLE leak_a (id int); CREATE TABLE leak_b (id int);');
+$log = log_for(
+        q{
+        BEGIN;
+        DROP TABLE leak_a;
+        ROLLBACK;
+        DROP TABLE leak_b;
+});
+is(count_matches($log, dropped_re('public.leak_a')),
+        0, 'rolled back drop is not logged by the next transaction');
+is(count_matches($log, dropped_re('public.leak_b')),
+        1, 'drop in the next transaction is logged');
+$node->safe_psql('postgres', 'DROP TABLE leak_a');
+
 
 done_testing();
